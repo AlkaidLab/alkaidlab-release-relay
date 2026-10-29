@@ -1,0 +1,18 @@
+products:
+  foundation-sunshine:
+    display_name: Foundation Sunshine
+    source:
+      kind: github
+      repository: AlkaidLab/foundation-sunshine
+    mirror:
+      # Supplied by the MirrorChyan integration PR/configuration.
+      resource_id: foundation-sunshine
+    assets:
+      - id: windows-installer
+        source_pattern: 'Sunshine.*.WindowsInstaller.exe'
+        os: win
+        arch: x64
+        resource_type: exec
+
+# Add other products only after MirrorChyan supplies their official resource ID,
+# platform/architecture mapping, and channel policy.
