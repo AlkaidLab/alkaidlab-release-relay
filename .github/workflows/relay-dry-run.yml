@@ -44,9 +44,12 @@ jobs:
           fi
           python scripts/relay_release.py "${args[@]}"
 
-      - name: Upload release record
-        uses: actions/upload-artifact@v4
-        with:
-          name: relay-${{ inputs.product }}-${{ github.run_id }}
-          path: out/release-record.json
-          if-no-files-found: error
+      - name: Publish validation summary
+        run: |
+          {
+            echo '## Relay validation record'
+            echo
+            echo '```json'
+            cat out/release-record.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

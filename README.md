@@ -12,7 +12,8 @@ asset selection, checksums, and distribution status.
 The first phase is a dry-run for Foundation Sunshine. It does not upload to
 MirrorChyan and does not change the source repository. It resolves a precise GitHub
 Release, checks the expected Windows installer, and writes a machine-readable release
-record as a workflow artifact.
+record to the workflow summary. It deliberately does not depend on Actions artifact
+storage, because the organization may have a full free artifact quota.
 
 Run it from **Actions → Relay release dry-run → Run workflow**. Leave `tag` empty to
 resolve the latest non-draft release, or provide an exact source tag.
