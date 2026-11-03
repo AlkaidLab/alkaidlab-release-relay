@@ -385,7 +385,14 @@ def relay_repository(config: dict[str, Any]) -> str:
 def source_client(product: dict[str, Any]) -> GitHubClient:
     source = product["source"]
     if parse_bool(source.get("public")):
-        return GitHubClient(token=None)
+        # Public sources are readable anonymously, but shared runner IPs hit the
+        # unauthenticated rate limit quickly; authenticate whenever a token exists.
+        token = (
+            os.environ.get("RELAY_SOURCE_TOKEN")
+            or os.environ.get("GITHUB_TOKEN")
+            or os.environ.get("GH_TOKEN")
+        )
+        return GitHubClient(token=token or None)
     token = os.environ.get("RELAY_SOURCE_TOKEN")
     if not token:
         raise RelayError(

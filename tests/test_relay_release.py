@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -1165,3 +1166,15 @@ class MirrorUploadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class PublicSourceTokenTest(unittest.TestCase):
+    def test_public_source_uses_workflow_token_when_present(self) -> None:
+        product = {"source": {"repository": "o/r", "public": True}}
+        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "t1", "RELAY_SOURCE_TOKEN": ""}, clear=False):
+            self.assertEqual(relay.source_client(product).token, "t1")
+
+    def test_public_source_is_anonymous_without_tokens(self) -> None:
+        product = {"source": {"repository": "o/r", "public": True}}
+        env = {k: v for k, v in os.environ.items() if k not in ("GITHUB_TOKEN", "GH_TOKEN", "RELAY_SOURCE_TOKEN")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertIsNone(relay.source_client(product).token)
