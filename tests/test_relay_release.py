@@ -1177,8 +1177,8 @@ class MultiProductSemverTests(unittest.TestCase):
 
     def test_channel_for_semver_prerelease(self) -> None:
         prod = {"version_scheme": "semver"}
-        # GitHub prerelease=False, but semver has rc -> channel should be beta
-        self.assertEqual("beta", relay.channel_for({"tag_name": "v1.3.9-rc.7", "prerelease": False}, prod))
+        # Marked Latest on GitHub: stable even with an rc identifier
+        self.assertEqual("stable", relay.channel_for({"tag_name": "v1.3.9-rc.7", "prerelease": False}, prod))
         # Normal release -> stable
         self.assertEqual("stable", relay.channel_for({"tag_name": "v1.3.9", "prerelease": False}, prod))
         # GitHub prerelease=True -> beta

@@ -434,14 +434,12 @@ def parse_relay_release_id(tag: str, product_key: str) -> int | None:
 
 
 def channel_for(release: dict[str, Any], product: dict[str, Any] | None = None) -> str:
-    if release.get("prerelease"):
-        return "beta"
-    scheme = (product.get("version_scheme") or "date-tag") if product else "date-tag"
-    if scheme == "semver":
-        tag = release.get("tag_name") or ""
-        if is_semver_prerelease(tag):
-            return "beta"
-    return "stable"
+    # The GitHub pre-release flag alone decides the channel. A release marked
+    # Latest stays stable even when its semver carries a prerelease identifier
+    # (macOS Enhanced ships rc builds as Latest). The version scheme only
+    # orders versions.
+    del product
+    return "beta" if release.get("prerelease") else "stable"
 
 
 def matching_assets(release: dict[str, Any], rule: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1489,13 +1487,6 @@ def parse_semver(tag: str) -> tuple[int, int, int, tuple[int, tuple]]:
                 parts.append((1, 0, part))
         prerelease_key = (0, tuple(parts))
     return (major, minor, patch, prerelease_key)
-
-
-def is_semver_prerelease(tag: str) -> bool:
-    m = SEMVER_PATTERN.match((tag or "").strip())
-    if not m:
-        return False
-    return bool(m.group(4))
 
 
 VERSION_DATE_TAG_PATTERN = re.compile(r"^v?(\d{4})\.(\d{1,4})\.(\d{1,6})(?:\.(.*))?$")
