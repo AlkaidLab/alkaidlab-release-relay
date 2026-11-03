@@ -118,6 +118,9 @@ The upload is guarded by the manifest, not by retry heuristics:
   normal release: upload once to `stable` (promotion) and sync the stable note.
 - Manifest has a `stable` upload but no `beta` upload and the source is now a
   pre-release: log the demotion and do not upload.
+- The source tag is older than or equal to the channel's reported latest: log
+  `skip upload` and do not upload. A tag that does not match
+  `v<year>.<mmdd>.<hhmmss>[.<suffix>]` is refused.
 - Manifest `started` or `failed`: flag the release for manual review rather than
   risk a second upload. The operator deletes the relay Release only after
   confirming with MirrorChyan that the version is absent.
@@ -142,13 +145,15 @@ The workflow runs one idempotent job per product and source release:
    file without an entry for the asset is an error.
 5. Create the namespaced relay Release and upload the same bytes plus the
    manifest, or reuse the existing one when the recorded bytes match.
-6. Upload the verified local file through MirrorChyan's documented version API:
+6. Compare the source tag with the version MirrorChyan reports for the target
+   channel; skip an equal or older tag and refuse an unparsable one.
+7. Upload the verified local file through MirrorChyan's documented version API:
    create the version, store the object, call back, then poll the processing
    status. The source tag is the version name and the channel is explicit.
-7. Confirm the version through the public MirrorChyan API. The version check is
+8. Confirm the version through the public MirrorChyan API. The version check is
    also what distinguishes a real upload from an artifact-upload failure inside
    the vendor action.
-8. Send the source release body to the release-note action, then record the
+9. Send the source release body to the release-note action, then record the
    outcome in the manifest.
 
 The workflow concurrency group serialises runs, and the job matrix is processed

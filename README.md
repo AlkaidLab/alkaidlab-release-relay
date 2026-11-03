@@ -38,6 +38,9 @@ Only `foundation-sunshine` Windows x64 is configured. See
 6. When a release is promoted from pre-release to stable, the same verified
    bytes are uploaded once to the stable channel and the note is synced to
    stable. A demotion back to pre-release is logged and never uploaded.
+7. Before a package upload, the source tag is compared with the version
+   MirrorChyan reports for that channel. An equal or older tag is skipped and
+   logged, and a tag outside `v<year>.<mmdd>.<hhmmss>[.<suffix>]` is refused.
 
 State lives in the relay Releases and their manifests. No Actions artifacts and
 no committed state files are required. See [docs/relay-architecture.md](docs/relay-architecture.md)

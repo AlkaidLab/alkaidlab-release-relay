@@ -757,6 +757,7 @@ def classify_known_release(
     relay: GitHubClient,
     relay_repo: str,
     dry_run: bool = False,
+    latest_lookup: Callable[[str], str | None] | None = None,
 ) -> list[dict[str, Any]]:
     rule = get_rule(product_key, product)
     matches = matching_assets(release, rule)
@@ -804,9 +805,13 @@ def classify_known_release(
             )
             return []
         if channel == "stable" and beta_uploaded:
+            if not upload_allowed(release, channel, latest_lookup):
+                return []
             return [
                 make_entry(product_key, release, "promote", "promotion", dry_run=dry_run)
             ]
+        if not upload_allowed(release, channel, latest_lookup):
+            return []
         return [make_entry(product_key, release, "import", "new", dry_run=dry_run)]
     body = release.get("body") or ""
     note = note_record(manifest, channel)
@@ -826,6 +831,7 @@ def plan_releases(
     product_key: str | None = None,
     tag: str | None = None,
     dry_run: bool = False,
+    latest_lookup: Callable[[str], str | None] | None = None,
 ) -> list[dict[str, Any]]:
     keys = [product_key] if product_key else sorted(config["products"])
     entries: list[dict[str, Any]] = []
@@ -853,18 +859,37 @@ def plan_releases(
             if dry_run and known is not None:
                 entries.extend(
                     classify_known_release(
-                        key, product, release, known, relay, relay_repo, dry_run=True
+                        key,
+                        product,
+                        release,
+                        known,
+                        relay,
+                        relay_repo,
+                        dry_run=True,
+                        latest_lookup=latest_lookup,
                     )
                 )
                 continue
             if dry_run:
-                entries.append(make_entry(key, release, "import", "dry-run", dry_run=True))
+                if upload_allowed(release, channel_for(release), latest_lookup):
+                    entries.append(
+                        make_entry(key, release, "import", "dry-run", dry_run=True)
+                    )
                 continue
             if known is None:
-                entries.append(make_entry(key, release, "import", "dispatched"))
+                if upload_allowed(release, channel_for(release), latest_lookup):
+                    entries.append(make_entry(key, release, "import", "dispatched"))
             else:
                 entries.extend(
-                    classify_known_release(key, product, release, known, relay, relay_repo)
+                    classify_known_release(
+                        key,
+                        product,
+                        release,
+                        known,
+                        relay,
+                        relay_repo,
+                        latest_lookup=latest_lookup,
+                    )
                 )
             continue
 
@@ -896,7 +921,8 @@ def plan_releases(
                 candidates = [item for item in importable if channel_for(item) == channel]
                 if candidates:
                     newest = max(candidates, key=lambda item: int(item["id"]))
-                    entries.append(make_entry(key, newest, "import", "bootstrap"))
+                    if upload_allowed(newest, channel, latest_lookup):
+                        entries.append(make_entry(key, newest, "import", "bootstrap"))
             continue
 
         newest_known_id = max(known)
@@ -913,7 +939,13 @@ def plan_releases(
             if release_id in known:
                 entries.extend(
                     classify_known_release(
-                        key, product, release, known[release_id], relay, relay_repo
+                        key,
+                        product,
+                        release,
+                        known[release_id],
+                        relay,
+                        relay_repo,
+                        latest_lookup=latest_lookup,
                     )
                 )
                 continue
@@ -928,7 +960,8 @@ def plan_releases(
                 and published > newest_known_published
             )
             if release_id > newest_known_id or newer_than_state:
-                entries.append(make_entry(key, release, "import", "new"))
+                if upload_allowed(release, channel_for(release), latest_lookup):
+                    entries.append(make_entry(key, release, "import", "new"))
     return entries
 
 
@@ -959,6 +992,7 @@ def prepare_release(
     wait_interval: float | None = None,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
+    latest_lookup: Callable[[str], str | None] | None = None,
 ) -> dict[str, Any]:
     product = get_product(config, product_key)
     rule = get_rule(product_key, product)
@@ -1097,6 +1131,10 @@ def prepare_release(
                     result["record"] = True
                 result["mirror_state"] = result.get("mirror_state", "already-uploaded")
                 return result
+
+    if latest_lookup is not None and not upload_allowed(release, channel, latest_lookup):
+        result["mirror_state"] = "skipped-not-newer"
+        return result
 
     release, asset = wait_for_asset(
         source,
@@ -1244,10 +1282,83 @@ def fetch_mirror_latest(
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError, TimeoutError) as error:
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError:
+            raise RelayError(
+                f"MirrorChyan version check returned HTTP {error.code}"
+            ) from None
+    except (urllib.error.URLError, OSError, TimeoutError) as error:
         raise RelayError(f"MirrorChyan version check failed: {error}") from None
     except json.JSONDecodeError as error:
         raise RelayError(f"MirrorChyan version check returned invalid JSON: {error}") from None
+
+
+VERSION_TAG_PATTERN = re.compile(r"^v(\d{4})\.(\d{1,4})\.(\d{1,6})(?:\..*)?$")
+
+
+def parse_version_tag(tag: str) -> tuple[int, int, int]:
+    """Parse ``v<year>.<mmdd>.<hhmmss>[.<suffix>]`` into comparable integers."""
+    match = VERSION_TAG_PATTERN.match(tag or "")
+    if not match:
+        raise RelayError(
+            f"cannot compare version tag {tag!r}; expected "
+            "v<year>.<mmdd>.<hhmmss>[.<suffix>]"
+        )
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+def version_is_newer(candidate: str, latest: str) -> bool:
+    return parse_version_tag(candidate) > parse_version_tag(latest)
+
+
+def mirror_latest_tag(
+    product_key: str,
+    product: dict[str, Any],
+    channel: str,
+    fetch: Callable[..., dict[str, Any]] = fetch_mirror_latest,
+) -> str | None:
+    """Return the version MirrorChyan serves for a channel, or None when empty."""
+    rule = get_rule(product_key, product)
+    payload = fetch(
+        str(product["mirror"]["resource_id"]),
+        channel,
+        rule.get("query_os") or rule["os"],
+        rule.get("query_arch") or rule["arch"],
+    )
+    code = payload.get("code")
+    if code == 0:
+        data = payload.get("data") or {}
+        version = data.get("version_name")
+        if not version:
+            raise RelayError("MirrorChyan latest response has no version_name")
+        return str(version)
+    if code == 8001:
+        return None
+    raise RelayError(
+        f"MirrorChyan latest query failed: code={code!r} msg={payload.get('msg')!r}"
+    )
+
+
+def upload_allowed(
+    release: dict[str, Any],
+    channel: str,
+    latest_lookup: Callable[[str], str | None] | None,
+) -> bool:
+    if latest_lookup is None:
+        return True
+    latest = latest_lookup(channel)
+    if latest is None:
+        return True
+    if version_is_newer(release["tag_name"], latest):
+        return True
+    log(
+        f"skip upload for {release['tag_name']}: MirrorChyan {channel} "
+        f"already serves {latest}"
+    )
+    return False
 
 
 def mirror_download_name(resource_id: str, version: str, os_name: str, arch: str, path: Path) -> str:
@@ -1536,6 +1647,18 @@ def cmd_plan(args: argparse.Namespace) -> int:
     for key in keys:
         product = get_product(config, key)
         source = client_for_product(product)
+        cache: dict[str, str | None] = {}
+
+        def lookup(
+            channel: str,
+            _key: str = key,
+            _product: dict = product,
+            _cache: dict[str, str | None] = cache,
+        ) -> str | None:
+            if channel not in _cache:
+                _cache[channel] = mirror_latest_tag(_key, _product, channel)
+            return _cache[channel]
+
         entries.extend(
             plan_releases(
                 config,
@@ -1545,6 +1668,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
                 product_key=key,
                 tag=args.tag or None,
                 dry_run=bool(args.tag and dry_run),
+                latest_lookup=lookup,
             )
         )
     summary, has_work, matrix_entries = summary_and_matrix(entries, event, live)
@@ -1608,6 +1732,16 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     relay: GitHubClient | None = None
     if live:
         relay = relay_client()
+    latest_lookup: Callable[[str], str | None] | None = None
+    if args.action in {"import", "promote"}:
+        latest_cache: dict[str, str | None] = {}
+
+        def latest_for(channel: str) -> str | None:
+            if channel not in latest_cache:
+                latest_cache[channel] = mirror_latest_tag(args.product, product, channel)
+            return latest_cache[channel]
+
+        latest_lookup = latest_for
     result = prepare_release(
         config,
         source,
@@ -1621,6 +1755,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         reason=args.reason or "",
         wait_timeout=args.wait_timeout,
         wait_interval=args.wait_interval,
+        latest_lookup=latest_lookup,
     )
     if args.json_out:
         path = Path(args.json_out)

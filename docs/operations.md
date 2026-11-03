@@ -46,6 +46,9 @@ A rerun is safe by design:
   the package.
 - A release whose source notes changed gets only a note sync.
 - A note that previously failed is retried by the next scheduled or manual run.
+- A release whose tag is not newer than MirrorChyan's current latest in that
+  channel is skipped with `skip upload` and is not uploaded. This covers a
+  late-published older draft and a backfill attempt.
 - A relay Release whose manifest says the upload was `started` or `failed` is
   flagged for manual review. The relay does not upload twice automatically
   because it cannot prove that an interrupted attempt never reached MirrorChyan.
@@ -56,6 +59,23 @@ bytes are uploaded with `channel=stable`, the stable note is synced, and the
 manifest keeps both channel records. Rerunning that release is a no-op. A
 release that goes back to `prerelease=true` after a stable upload is a demotion;
 the relay logs `demotion ignored` and does not upload it to `beta` again.
+
+## Version ordering
+
+MirrorChyan treats the last successful upload as the latest version, so the
+relay never lets a late or backfilled build move users backwards. Before an
+upload it reads the public latest version for the target channel:
+
+```text
+GET https://mirrorchyan.com/api/resources/foundation-sunshine/latest?os=windows&arch=amd64&channel=stable
+```
+
+The comparison uses the project's tag rule `v<year>.<mmdd>.<hhmmss>[.<suffix>]`,
+parsed as three integers; the time fields are not zero-padded and the suffix is
+ignored. A candidate that is older than or equal to the reported version is
+skipped and logged. A tag that does not parse is refused, because the relay
+cannot prove the ordering. A response with code `8001` means the channel has no
+package yet and the upload is allowed; any other API error fails the run.
 
 ## Roll back
 
@@ -160,6 +180,9 @@ is not affected.
   source release, then rerun.
 - checksum mismatch: the release is inconsistent. Do not upload; ask the source
   maintainer to republish the release and its checksum files.
+- `skip upload ... already serves`: the candidate is not newer than MirrorChyan's
+  latest in that channel. Nothing is wrong; the relay protected users from a
+  downgrade. A newer release will upload normally.
 - `changed after import`: the source asset was replaced under the same release.
   Review the bytes; if a new upload is intended, get MirrorChyan's agreement,
   delete the relay Release and rerun.

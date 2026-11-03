@@ -580,6 +580,31 @@ class PlanningTests(unittest.TestCase):
         with self.assertRaisesRegex(relay.RelayError, "unknown product"):
             relay.get_product(make_config(), "other-product")
 
+    def test_plan_skips_older_or_equal_to_mirror_latest(self) -> None:
+        add_source_release(self.fake, 200, "v2026.1031.121458.杂鱼")
+        for latest in ("v2026.1031.121458.杂鱼", "v2026.1102.182113.杂鱼"):
+            entries = relay.plan_releases(
+                make_config(), self.fake, self.fake, RELAY_REPO,
+                latest_lookup=lambda channel, value=latest: value,
+            )
+            self.assertEqual([], entries)
+
+    def test_plan_allows_newer_than_mirror_latest(self) -> None:
+        add_source_release(self.fake, 200, "v2026.1031.121458.杂鱼")
+        entries = relay.plan_releases(
+            make_config(), self.fake, self.fake, RELAY_REPO,
+            latest_lookup=lambda channel: "v2026.1020.23431.杂鱼",
+        )
+        self.assertEqual(1, len(entries))
+
+    def test_plan_refuses_unparsable_tag(self) -> None:
+        add_source_release(self.fake, 200, "release-2026")
+        with self.assertRaisesRegex(relay.RelayError, "cannot compare"):
+            relay.plan_releases(
+                make_config(), self.fake, self.fake, RELAY_REPO,
+                latest_lookup=lambda channel: "v2026.1020.23431.杂鱼",
+            )
+
     def _promotion(self) -> dict:
         release = add_source_release(self.fake, 200, "v2", prerelease=True, body="notes")
         add_relay_release(self.fake, release)
@@ -649,7 +674,7 @@ class ImportTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def _prepare(self, live: bool = True) -> dict:
+    def _prepare(self, live: bool = True, latest_lookup=None) -> dict:
         clock = FakeClock()
         return relay.prepare_release(
             self.config,
@@ -663,6 +688,7 @@ class ImportTests(unittest.TestCase):
             self.staging,
             sleep=clock.sleep,
             clock=clock.clock,
+            latest_lookup=latest_lookup,
         )
 
     def test_dry_run_does_not_write(self) -> None:
@@ -671,6 +697,44 @@ class ImportTests(unittest.TestCase):
         self.assertEqual([], self.fake.created)
         self.assertEqual([], self.fake.uploads)
         self.assertTrue((self.staging / "foundation-sunshine" / str(self.release["id"])).exists())
+
+    def test_import_uploads_newer_than_mirror_latest(self) -> None:
+        result = self._prepare(
+            latest_lookup=lambda channel: "v2026.1020.23431.杂鱼"
+        )
+        self.assertTrue(result["upload"])
+
+    def test_import_skips_equal_to_mirror_latest(self) -> None:
+        with mock.patch.object(relay, "log") as log:
+            result = self._prepare(
+                latest_lookup=lambda channel: self.release["tag_name"]
+            )
+        self.assertFalse(result["upload"])
+        self.assertEqual("skipped-not-newer", result["mirror_state"])
+        self.assertTrue(
+            any("skip upload" in str(call) for call in log.call_args_list)
+        )
+
+    def test_import_skips_older_than_mirror_latest(self) -> None:
+        with mock.patch.object(relay, "log") as log:
+            result = self._prepare(
+                latest_lookup=lambda channel: "v2026.1102.182113.杂鱼"
+            )
+        self.assertFalse(result["upload"])
+        self.assertEqual("skipped-not-newer", result["mirror_state"])
+        self.assertTrue(
+            any("skip upload" in str(call) for call in log.call_args_list)
+        )
+
+    def test_import_refuses_unparsable_version(self) -> None:
+        add_source_release(self.fake, 300, "release-2026")
+        with self.assertRaisesRegex(relay.RelayError, "cannot compare"):
+            relay.prepare_release(
+                self.config, self.fake, self.fake, RELAY_REPO,
+                "foundation-sunshine", 300, "import", True, self.staging,
+                sleep=lambda _: None, clock=lambda: 0.0,
+                latest_lookup=lambda channel: "v2026.1020.23431.杂鱼",
+            )
 
     def test_import_creates_relay_release_and_manifest(self) -> None:
         result = self._prepare()
@@ -827,6 +891,64 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("MirrorChyan/uploading-action@v1", text)
         self.assertIn("macos-latest", text)
         self.assertIn("--channel", text)
+
+
+class VersionGuardTests(unittest.TestCase):
+    def test_parse_version_tag_ignores_suffix_and_unpadded_fields(self) -> None:
+        self.assertEqual(
+            (2026, 1031, 121458),
+            relay.parse_version_tag("v2026.1031.121458.杂鱼"),
+        )
+        self.assertEqual(
+            (2026, 925, 152547), relay.parse_version_tag("v2026.925.152547.杂鱼")
+        )
+        self.assertEqual(
+            (2026, 1102, 92803), relay.parse_version_tag("v2026.1102.92803")
+        )
+
+    def test_ordering(self) -> None:
+        self.assertTrue(
+            relay.version_is_newer(
+                "v2026.1103.21122.杂鱼", "v2026.1102.182113.杂鱼"
+            )
+        )
+        self.assertFalse(
+            relay.version_is_newer(
+                "v2026.1102.182113.杂鱼", "v2026.1103.21122.杂鱼"
+            )
+        )
+        self.assertFalse(
+            relay.version_is_newer(
+                "v2026.1102.182113.杂鱼", "v2026.1102.182113.杂鱼"
+            )
+        )
+
+    def test_unparsable_tag_is_refused(self) -> None:
+        for tag in ("2026.1103", "v2026.1103.21122-rc1", "nightly"):
+            with self.assertRaisesRegex(relay.RelayError, "cannot compare"):
+                relay.parse_version_tag(tag)
+
+    def test_mirror_latest_tag_reads_public_response(self) -> None:
+        product = make_config()["products"]["foundation-sunshine"]
+        payload = {"code": 0, "data": {"version_name": "v2026.1020.23431.杂鱼"}}
+        self.assertEqual(
+            "v2026.1020.23431.杂鱼",
+            relay.mirror_latest_tag(
+                "foundation-sunshine", product, "stable", fetch=lambda *_: payload
+            ),
+        )
+        self.assertIsNone(
+            relay.mirror_latest_tag(
+                "foundation-sunshine", product, "stable", fetch=lambda *_: {"code": 8001}
+            )
+        )
+        with self.assertRaisesRegex(relay.RelayError, "latest query failed"):
+            relay.mirror_latest_tag(
+                "foundation-sunshine",
+                product,
+                "stable",
+                fetch=lambda *_: {"code": 7002, "msg": "KEY_INVALID"},
+            )
 
 
 class LiveGatingTests(unittest.TestCase):
