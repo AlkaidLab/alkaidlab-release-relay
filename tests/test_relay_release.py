@@ -1165,3 +1165,84 @@ class MirrorUploadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MultiProductSemverTests(unittest.TestCase):
+    def test_semver_ordering_prerelease(self) -> None:
+        self.assertTrue(relay.version_is_newer("1.3.9", "1.3.9-rc.7", scheme="semver"))
+        self.assertTrue(relay.version_is_newer("v1.3.9-rc.7", "v1.3.9-rc.6", scheme="semver"))
+        self.assertTrue(relay.version_is_newer("12.14.2", "12.14.2-beta.1", scheme="semver"))
+        self.assertFalse(relay.version_is_newer("1.3.9-rc.7", "1.3.9", scheme="semver"))
+        self.assertFalse(relay.version_is_newer("1.3.9-rc.7", "1.3.9-rc.7", scheme="semver"))
+
+    def test_channel_for_semver_prerelease(self) -> None:
+        prod = {"version_scheme": "semver"}
+        # GitHub prerelease=False, but semver has rc -> channel should be beta
+        self.assertEqual("beta", relay.channel_for({"tag_name": "v1.3.9-rc.7", "prerelease": False}, prod))
+        # Normal release -> stable
+        self.assertEqual("stable", relay.channel_for({"tag_name": "v1.3.9", "prerelease": False}, prod))
+        # GitHub prerelease=True -> beta
+        self.assertEqual("beta", relay.channel_for({"tag_name": "v1.3.9", "prerelease": True}, prod))
+
+    def test_staging_only_product_prepare(self) -> None:
+        config = {
+            "relay": {"repository": RELAY_REPO},
+            "products": {
+                "staging-app": {
+                    "display_name": "Staging App",
+                    "version_scheme": "semver",
+                    "source": {"kind": "github", "repository": "test/staging-app", "public": True},
+                    "mirror": {"resource_id": None},
+                    "asset_wait": {"timeout_seconds": 10, "interval_seconds": 5},
+                    "checksums": {"assets": []},
+                    "assets": [
+                        {
+                            "id": "apk",
+                            "source_pattern": "*.apk",
+                            "os": "android",
+                            "arch": "arm64",
+                            "resource_type": "exec",
+                        }
+                    ],
+                }
+            },
+        }
+        fake = FakeGitHub()
+        rel = {
+            "id": 500,
+            "tag_name": "v1.0.0",
+            "name": "Release 1.0.0",
+            "body": "staging release notes",
+            "draft": False,
+            "prerelease": False,
+            "published_at": "2026-11-01T00:00:00Z",
+            "updated_at": "2026-11-01T00:00:00Z",
+            "html_url": "https://github.com/test/staging-app/releases/tag/v1.0.0",
+            "assets": [
+                {
+                    "id": 5001,
+                    "name": "app.apk",
+                    "size": len(b"dummy apk bytes"),
+                    "state": "uploaded",
+                    "browser_download_url": "https://source.test/500/app.apk",
+                }
+            ],
+        }
+        fake.files["https://source.test/500/app.apk"] = b"dummy apk bytes"
+        fake.repositories["test/staging-app"] = {500: rel}
+        with tempfile.TemporaryDirectory() as staging:
+            res = relay.prepare_release(
+                config, fake, fake, RELAY_REPO,
+                "staging-app", 500, "import", True, Path(staging),
+                asset_rule_id="apk", sleep=lambda _: None, clock=lambda: 0.0,
+            )
+            self.assertFalse(res["upload"])
+            self.assertTrue(res["staging_only"])
+            self.assertEqual("staged", res["mirror_state"])
+            # Manifest was created in relay repo
+            relay_tag = relay.build_relay_tag("staging-app", "v1.0.0", 500)
+            relay_rel = fake.get_release_by_tag(RELAY_REPO, relay_tag)
+            self.assertIsNotNone(relay_rel)
+            manifest = relay.read_manifest(fake, RELAY_REPO, relay_rel)
+            self.assertIsNotNone(manifest)
+            self.assertEqual("staged", relay.upload_record(manifest, "stable", "apk")["status"])

@@ -334,6 +334,36 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
     return config
 
 
+def get_rules(product_key: str, product: dict[str, Any]) -> list[dict[str, Any]]:
+    rules = product.get("assets") or []
+    if not rules:
+        raise RelayError(f"product {product_key!r} must describe at least one asset rule")
+    seen_ids = set()
+    for rule in rules:
+        for field in ("id", "source_pattern", "os", "arch"):
+            if not rule.get(field):
+                raise RelayError(f"product {product_key!r} asset rule is missing {field!r}")
+        rule_id = rule["id"]
+        if rule_id in seen_ids:
+            raise RelayError(f"product {product_key!r} has duplicate asset rule id {rule_id!r}")
+        seen_ids.add(rule_id)
+    return rules
+
+
+def get_rule(product_key: str, product: dict[str, Any], rule_id: str | None = None) -> dict[str, Any]:
+    rules = get_rules(product_key, product)
+    if rule_id is not None:
+        for rule in rules:
+            if rule["id"] == rule_id:
+                return rule
+        raise RelayError(f"product {product_key!r} has no asset rule with id {rule_id!r}")
+    if len(rules) == 1:
+        return rules[0]
+    raise RelayError(
+        f"product {product_key!r} has {len(rules)} asset rules; rule_id must be specified"
+    )
+
+
 def get_product(config: dict[str, Any], product_key: str) -> dict[str, Any]:
     products = config["products"]
     if product_key not in products:
@@ -352,25 +382,8 @@ def get_product(config: dict[str, Any], product_key: str) -> dict[str, Any]:
             f"product {product_key!r} must declare source.public so the relay knows "
             "whether a read token is required"
         )
-    mirror = product.get("mirror") or {}
-    if not mirror.get("resource_id"):
-        raise RelayError(f"product {product_key!r} has no mirror.resource_id")
-    get_rule(product_key, product)
+    get_rules(product_key, product)
     return product
-
-
-def get_rule(product_key: str, product: dict[str, Any]) -> dict[str, Any]:
-    rules = product.get("assets") or []
-    if len(rules) != 1:
-        raise RelayError(
-            f"product {product_key!r} must describe exactly one asset rule; "
-            "separate resource streams belong in separate products"
-        )
-    rule = rules[0]
-    for field in ("id", "source_pattern", "os", "arch"):
-        if not rule.get(field):
-            raise RelayError(f"product {product_key!r} asset rule is missing {field!r}")
-    return rule
 
 
 def relay_repository(config: dict[str, Any]) -> str:
@@ -420,8 +433,15 @@ def parse_relay_release_id(tag: str, product_key: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def channel_for(release: dict[str, Any]) -> str:
-    return "beta" if release.get("prerelease") else "stable"
+def channel_for(release: dict[str, Any], product: dict[str, Any] | None = None) -> str:
+    if release.get("prerelease"):
+        return "beta"
+    scheme = (product.get("version_scheme") or "date-tag") if product else "date-tag"
+    if scheme == "semver":
+        tag = release.get("tag_name") or ""
+        if is_semver_prerelease(tag):
+            return "beta"
+    return "stable"
 
 
 def matching_assets(release: dict[str, Any], rule: dict[str, Any]) -> list[dict[str, Any]]:
@@ -593,11 +613,19 @@ def write_manifest(
 
 
 def relay_asset_problem(
-    relay_release: dict[str, Any], manifest: dict[str, Any]
+    relay_release: dict[str, Any], manifest: dict[str, Any], asset_rule_id: str | None = None
 ) -> str | None:
     """Return a reason when the relay Release no longer carries the recorded asset."""
-    asset = manifest.get("asset") or {}
-    name = asset.get("name")
+    asset_info = None
+    assets = manifest.get("assets")
+    if isinstance(assets, dict) and asset_rule_id and asset_rule_id in assets:
+        asset_info = assets[asset_rule_id]
+    elif manifest.get("asset"):
+        if not asset_rule_id or manifest["asset"].get("rule") == asset_rule_id:
+            asset_info = manifest["asset"]
+    if not asset_info:
+        return None
+    name = asset_info.get("name")
     found = [
         item
         for item in relay_release.get("assets") or []
@@ -605,13 +633,13 @@ def relay_asset_problem(
     ]
     if len(found) != 1:
         return f"relay release has {len(found)} assets named {name!r}"
-    if int(found[0].get("size", -1)) != int(asset.get("size", -2)):
+    if int(found[0].get("size", -1)) != int(asset_info.get("size", -2)):
         return f"relay asset {name!r} size does not match the manifest"
     return None
 
 
 def migrate_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
-    """Normalise an older single-channel manifest to per-channel records."""
+    """Normalise an older single-channel or single-asset manifest to schema 2."""
     mirror = manifest.setdefault("mirror", {})
     uploads = mirror.get("uploads")
     if not isinstance(uploads, dict):
@@ -640,7 +668,22 @@ def migrate_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     return manifest
 
 
-def upload_record(manifest: dict[str, Any], channel: str) -> dict[str, Any]:
+def asset_upload_record(manifest: dict[str, Any], asset_rule_id: str, channel: str) -> dict[str, Any]:
+    assets = manifest.get("assets")
+    if isinstance(assets, dict) and asset_rule_id in assets:
+        return assets[asset_rule_id].get("mirror", {}).get("uploads", {}).get(channel) or {}
+    # Legacy single-asset fallback
+    single_rule = (manifest.get("asset") or {}).get("rule")
+    if not single_rule or single_rule == asset_rule_id:
+        return (manifest.get("mirror") or {}).get("uploads", {}).get(channel) or {}
+    return {}
+
+
+def upload_record(manifest: dict[str, Any], channel: str, asset_rule_id: str | None = None) -> dict[str, Any]:
+    if asset_rule_id is not None:
+        rec = asset_upload_record(manifest, asset_rule_id, channel)
+        if rec:
+            return rec
     return (manifest.get("mirror") or {}).get("uploads", {}).get(channel) or {}
 
 
@@ -653,14 +696,17 @@ def build_manifest(
     product: dict[str, Any],
     release: dict[str, Any],
     asset: dict[str, Any],
+    rule: dict[str, Any],
     size: int,
     digest: str,
     checksum_files: list[str],
     relay_tag: str,
     live: bool,
 ) -> dict[str, Any]:
-    rule = get_rule(product_key, product)
-    mirror = product["mirror"]
+    mirror = product.get("mirror") or {}
+    resource_id = rule.get("resource_id") or mirror.get("resource_id")
+    ch = channel_for(release, product)
+    rule_id = rule["id"]
     return {
         "schema_version": 2,
         "product": product_key,
@@ -674,29 +720,51 @@ def build_manifest(
             "body_sha256": text_sha256(release.get("body") or ""),
         },
         "asset": {
-            "rule": rule["id"],
+            "rule": rule_id,
             "source_asset_id": int(asset["id"]),
             "name": asset["name"],
             "size": int(size),
             "sha256": digest,
             "checksum_files": checksum_files,
         },
+        "assets": {
+            rule_id: {
+                "rule": rule_id,
+                "source_asset_id": int(asset["id"]),
+                "name": asset["name"],
+                "size": int(size),
+                "sha256": digest,
+                "checksum_files": checksum_files,
+                "mirror": {
+                    "resource_id": resource_id,
+                    "os": rule["os"],
+                    "arch": rule["arch"],
+                    "uploads": {
+                        ch: {
+                            "status": "started" if (live and resource_id) else ("staged" if live else "pending"),
+                            "started_at": iso_now() if live else None,
+                            "run_url": os.environ.get("RELAY_RUN_URL"),
+                        }
+                    },
+                },
+            }
+        },
         "relay": {"tag": relay_tag, "created_at": iso_now()},
         "mirror": {
-            "resource_id": mirror["resource_id"],
+            "resource_id": resource_id,
             "version_name": release["tag_name"],
-            "channel": channel_for(release),
+            "channel": ch,
             "os": rule["os"],
             "arch": rule["arch"],
             "uploads": {
-                channel_for(release): {
-                    "status": "started" if live else "pending",
+                ch: {
+                    "status": "started" if (live and resource_id) else ("staged" if live else "pending"),
                     "started_at": iso_now() if live else None,
                     "run_url": os.environ.get("RELAY_RUN_URL"),
                 }
             },
         },
-        "note": {"channel": channel_for(release), "uploads": {}},
+        "note": {"channel": ch, "uploads": {}},
     }
 
 
@@ -733,20 +801,31 @@ def make_entry(
     action: str,
     reason: str,
     dry_run: bool = False,
+    asset_id: str | None = None,
+    product: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    entry = {
         "product": product_key,
         "release_id": int(release["id"]),
         "tag": release["tag_name"],
-        "channel": channel_for(release),
+        "channel": channel_for(release, product),
         "action": action,
         "reason": reason,
         "dry_run": dry_run,
     }
+    if asset_id is not None:
+        entry["asset"] = asset_id
+    return entry
 
 
-def attention_entry(product_key: str, release: dict[str, Any], reason: str) -> dict[str, Any]:
-    return make_entry(product_key, release, "attention", reason)
+def attention_entry(
+    product_key: str,
+    release: dict[str, Any],
+    reason: str,
+    asset_id: str | None = None,
+    product: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return make_entry(product_key, release, "attention", reason, asset_id=asset_id, product=product)
 
 
 def classify_known_release(
@@ -757,19 +836,9 @@ def classify_known_release(
     relay: GitHubClient,
     relay_repo: str,
     dry_run: bool = False,
-    latest_lookup: Callable[[str], str | None] | None = None,
+    latest_lookup: Callable[[str, str], str | None] | None = None,
 ) -> list[dict[str, Any]]:
-    rule = get_rule(product_key, product)
-    matches = matching_assets(release, rule)
-    if len(matches) != 1:
-        names = [asset.get("name") for asset in matches]
-        return [
-            attention_entry(
-                product_key,
-                release,
-                f"asset rule {rule['id']!r} now matches {len(matches)} assets: {names}",
-            )
-        ]
+    rules = get_rules(product_key, product)
     manifest = read_manifest(relay, relay_repo, relay_release)
     if manifest is None:
         return [
@@ -777,50 +846,82 @@ def classify_known_release(
                 product_key,
                 release,
                 f"relay release {relay_release.get('tag_name')} has no {MANIFEST_NAME}",
+                product=product,
             )
         ]
     manifest = migrate_manifest(manifest)
-    problem = relay_asset_problem(relay_release, manifest)
-    if problem is not None:
-        return [attention_entry(product_key, release, problem)]
-    channel = channel_for(release)
-    current = upload_record(manifest, channel)
-    status = current.get("status")
-    if status in {"started", "failed"}:
-        return [
-            attention_entry(
-                product_key,
-                release,
-                f"MirrorChyan {channel} upload for {relay_release.get('tag_name')} "
-                f"is {status!r}; inspect MirrorChyan before removing the relay release",
+    channel = channel_for(release, product)
+    entries: list[dict[str, Any]] = []
+
+    any_demotion_ignored = False
+    for rule in rules:
+        rule_id = rule["id"]
+        matches = matching_assets(release, rule)
+        if len(matches) != 1:
+            names = [asset.get("name") for asset in matches]
+            entries.append(
+                attention_entry(
+                    product_key,
+                    release,
+                    f"asset rule {rule_id!r} now matches {len(matches)} assets: {names}",
+                    asset_id=rule_id,
+                    product=product,
+                )
             )
-        ]
-    stable_uploaded = upload_record(manifest, "stable").get("status") == "uploaded"
-    beta_uploaded = upload_record(manifest, "beta").get("status") == "uploaded"
-    if status != "uploaded":
-        if channel == "beta" and stable_uploaded:
-            log(
-                f"demotion ignored for {release['tag_name']}: the stable upload "
-                "already exists; not uploading to beta"
+            continue
+        problem = relay_asset_problem(relay_release, manifest, asset_rule_id=rule_id)
+        if problem is not None:
+            entries.append(attention_entry(product_key, release, problem, asset_id=rule_id, product=product))
+            continue
+        current = upload_record(manifest, channel, asset_rule_id=rule_id)
+        status = current.get("status")
+        if status in {"started", "failed"}:
+            entries.append(
+                attention_entry(
+                    product_key,
+                    release,
+                    f"MirrorChyan {channel} upload for {relay_release.get('tag_name')} asset {rule_id} "
+                    f"is {status!r}; inspect MirrorChyan before removing the relay release",
+                    asset_id=rule_id,
+                    product=product,
+                )
             )
-            return []
-        if channel == "stable" and beta_uploaded:
-            if not upload_allowed(release, channel, latest_lookup):
-                return []
-            return [
-                make_entry(product_key, release, "promote", "promotion", dry_run=dry_run)
-            ]
-        if not upload_allowed(release, channel, latest_lookup):
-            return []
-        return [make_entry(product_key, release, "import", "new", dry_run=dry_run)]
-    body = release.get("body") or ""
-    note = note_record(manifest, channel)
-    if note.get("status") == "failed":
-        return [make_entry(product_key, release, "note", "retry-note", dry_run=dry_run)]
-    if note.get("body_sha256") != text_sha256(body) and body:
-        reason = "note-missing" if note.get("body_sha256") is None else "edited"
-        return [make_entry(product_key, release, "note", reason, dry_run=dry_run)]
-    return []
+            continue
+        stable_status = upload_record(manifest, "stable", asset_rule_id=rule_id).get("status")
+        beta_status = upload_record(manifest, "beta", asset_rule_id=rule_id).get("status")
+        stable_done = stable_status in {"uploaded", "staged"}
+        beta_done = beta_status in {"uploaded", "staged"}
+        done = status in {"uploaded", "staged"}
+
+        if not done:
+            if channel == "beta" and stable_done:
+                log(
+                    f"demotion ignored for {release['tag_name']}: the stable upload "
+                    "already exists; not uploading to beta"
+                )
+                any_demotion_ignored = True
+                continue
+            if channel == "stable" and beta_done:
+                if not upload_allowed(release, channel, latest_lookup, product=product, rule=rule):
+                    continue
+                entries.append(
+                    make_entry(product_key, release, "promote", "promotion", dry_run=dry_run, asset_id=rule_id, product=product)
+                )
+                continue
+            if not upload_allowed(release, channel, latest_lookup, product=product, rule=rule):
+                continue
+            entries.append(make_entry(product_key, release, "import", "new", dry_run=dry_run, asset_id=rule_id, product=product))
+
+    # Note sync is only checked when not uploading/promoting and not demoted
+    if not entries and not any_demotion_ignored:
+        body = release.get("body") or ""
+        note = note_record(manifest, channel)
+        if note.get("status") == "failed":
+            entries.append(make_entry(product_key, release, "note", "retry-note", dry_run=dry_run, product=product))
+        elif note.get("body_sha256") != text_sha256(body) and body:
+            reason = "note-missing" if note.get("body_sha256") is None else "edited"
+            entries.append(make_entry(product_key, release, "note", reason, dry_run=dry_run, product=product))
+    return entries
 
 
 def plan_releases(
@@ -831,25 +932,26 @@ def plan_releases(
     product_key: str | None = None,
     tag: str | None = None,
     dry_run: bool = False,
-    latest_lookup: Callable[[str], str | None] | None = None,
+    latest_lookup: Callable[[str, str], str | None] | None = None,
 ) -> list[dict[str, Any]]:
     keys = [product_key] if product_key else sorted(config["products"])
     entries: list[dict[str, Any]] = []
     for key in keys:
         product = get_product(config, key)
         repository = product["source"]["repository"]
-        rule = get_rule(key, product)
+        rules = get_rules(key, product)
         if tag:
             release = source.get_release_by_tag(repository, tag)
             if release is None:
                 raise RelayError(f"source release tag {tag!r} not found in {repository}")
             if release.get("draft"):
                 raise RelayError(f"source release {tag!r} is a draft")
-            if len(matching_assets(release, rule)) != 1:
-                raise RelayError(
-                    f"source release {tag!r} does not contain exactly one asset matching "
-                    f"{rule['source_pattern']!r}"
-                )
+            for rule in rules:
+                if len(matching_assets(release, rule)) != 1:
+                    raise RelayError(
+                        f"source release {tag!r} does not contain exactly one asset matching "
+                        f"{rule['source_pattern']!r}"
+                    )
             relay_tag = build_relay_tag(key, release["tag_name"], int(release["id"]))
             known = (
                 relay.get_release_by_tag(relay_repo, relay_tag)
@@ -871,14 +973,18 @@ def plan_releases(
                 )
                 continue
             if dry_run:
-                if upload_allowed(release, channel_for(release), latest_lookup):
-                    entries.append(
-                        make_entry(key, release, "import", "dry-run", dry_run=True)
-                    )
+                ch = channel_for(release, product)
+                for rule in rules:
+                    if upload_allowed(release, ch, latest_lookup, product=product, rule=rule):
+                        entries.append(
+                            make_entry(key, release, "import", "dry-run", dry_run=True, asset_id=rule["id"], product=product)
+                        )
                 continue
             if known is None:
-                if upload_allowed(release, channel_for(release), latest_lookup):
-                    entries.append(make_entry(key, release, "import", "dispatched"))
+                ch = channel_for(release, product)
+                for rule in rules:
+                    if upload_allowed(release, ch, latest_lookup, product=product, rule=rule):
+                        entries.append(make_entry(key, release, "import", "dispatched", asset_id=rule["id"], product=product))
             else:
                 entries.extend(
                     classify_known_release(
@@ -910,19 +1016,26 @@ def plan_releases(
                         key,
                         {"id": release_id, "tag_name": f"release {release_id}"},
                         "two relay releases carry the same source release id",
+                        product=product,
                     )
                 )
                 continue
             known[release_id] = relay_release
 
-        importable = [item for item in releases if len(matching_assets(item, rule)) == 1]
+        importable = [
+            item for item in releases
+            if any(len(matching_assets(item, rule)) == 1 for rule in rules)
+        ]
         if not known:
             for channel in ("stable", "beta"):
-                candidates = [item for item in importable if channel_for(item) == channel]
+                candidates = [item for item in importable if channel_for(item, product) == channel]
                 if candidates:
                     newest = max(candidates, key=lambda item: int(item["id"]))
-                    if upload_allowed(newest, channel, latest_lookup):
-                        entries.append(make_entry(key, newest, "import", "bootstrap"))
+                    for rule in rules:
+                        if len(matching_assets(newest, rule)) == 1 and upload_allowed(
+                            newest, channel, latest_lookup, product=product, rule=rule
+                        ):
+                            entries.append(make_entry(key, newest, "import", "bootstrap", asset_id=rule["id"], product=product))
             continue
 
         newest_known_id = max(known)
@@ -949,19 +1062,19 @@ def plan_releases(
                     )
                 )
                 continue
-            if len(matching_assets(release, rule)) != 1:
-                continue
             published = parse_time(release.get("published_at"))
-            # A late-published draft can carry an older id; its publication time
-            # distinguishes it from history replayed after the bootstrap.
             newer_than_state = (
                 newest_known_published is not None
                 and published is not None
                 and published > newest_known_published
             )
             if release_id > newest_known_id or newer_than_state:
-                if upload_allowed(release, channel_for(release), latest_lookup):
-                    entries.append(make_entry(key, release, "import", "new"))
+                ch = channel_for(release, product)
+                for rule in rules:
+                    if len(matching_assets(release, rule)) == 1 and upload_allowed(
+                        release, ch, latest_lookup, product=product, rule=rule
+                    ):
+                        entries.append(make_entry(key, release, "import", "new", asset_id=rule["id"], product=product))
     return entries
 
 
@@ -987,16 +1100,18 @@ def prepare_release(
     action: str,
     live: bool,
     staging_dir: Path,
+    asset_rule_id: str | None = None,
     reason: str = "",
     wait_timeout: float | None = None,
     wait_interval: float | None = None,
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
-    latest_lookup: Callable[[str], str | None] | None = None,
+    latest_lookup: Callable[[str, str], str | None] | None = None,
 ) -> dict[str, Any]:
     product = get_product(config, product_key)
-    rule = get_rule(product_key, product)
-    mirror = product["mirror"]
+    rule = get_rule(product_key, product, asset_rule_id)
+    mirror = product.get("mirror") or {}
+    resource_id = rule.get("resource_id") or mirror.get("resource_id")
     wait_config = product.get("asset_wait") or {}
     if wait_timeout is None:
         wait_timeout = float(wait_config.get("timeout_seconds", 600))
@@ -1010,15 +1125,17 @@ def prepare_release(
         raise RelayError(f"source release {release['tag_name']} is a draft")
     body = release.get("body") or ""
     body_hash = text_sha256(body)
-    channel = channel_for(release)
+    channel = channel_for(release, product)
     relay_tag = build_relay_tag(product_key, release["tag_name"], int(release["id"]))
     result: dict[str, Any] = {
         "product": product_key,
         "release_id": int(release["id"]),
+        "asset": rule["id"],
         "tag": release["tag_name"],
         "version_name": release["tag_name"],
         "channel": channel,
-        "resource_id": mirror["resource_id"],
+        "resource_id": resource_id,
+        "staging_only": resource_id is None,
         "os": rule["os"],
         "arch": rule["arch"],
         "query_os": rule.get("query_os") or rule["os"],
@@ -1055,7 +1172,7 @@ def prepare_release(
         note = note_record(manifest, channel)
         if note.get("body_sha256") == body_hash and note.get("status") != "failed":
             return result
-        result["sync_note"] = True
+        result["sync_note"] = bool(resource_id)
         result["record"] = True
         return result
 
@@ -1082,10 +1199,10 @@ def prepare_release(
             if manifest is None:
                 raise RelayError(f"relay release {relay_tag} has no {MANIFEST_NAME}")
             manifest = migrate_manifest(manifest)
-            problem = relay_asset_problem(relay_release, manifest)
+            problem = relay_asset_problem(relay_release, manifest, asset_rule_id=rule["id"])
             if problem is not None:
                 raise RelayError(problem)
-            recorded = manifest.get("asset") or {}
+            recorded = manifest.get("assets", {}).get(rule["id"]) or manifest.get("asset") or {}
             if int(recorded.get("source_asset_id", -1)) != int(current_asset["id"]):
                 raise RelayError(
                     f"source asset for {release['tag_name']} changed after import; "
@@ -1095,20 +1212,20 @@ def prepare_release(
                 raise RelayError(
                     f"source asset size for {release['tag_name']} changed after import"
                 )
-            status = upload_record(manifest, channel).get("status")
+            status = upload_record(manifest, channel, asset_rule_id=rule["id"]).get("status")
             if status in {"started", "failed"}:
                 raise RelayError(
-                    f"MirrorChyan {channel} upload for {relay_tag} is {status!r}; inspect "
+                    f"MirrorChyan {channel} upload for {relay_tag} asset {rule['id']} is {status!r}; inspect "
                     "MirrorChyan before removing the relay release"
                 )
-            if status == "uploaded":
+            if status in {"uploaded", "staged"}:
                 needs_upload = False
             elif (
                 channel == "beta"
-                and upload_record(manifest, "stable").get("status") == "uploaded"
+                and upload_record(manifest, "stable", asset_rule_id=rule["id"]).get("status") in {"uploaded", "staged"}
             ):
                 log(
-                    f"demotion ignored for {release['tag_name']}: the stable upload "
+                    f"demotion ignored for {release['tag_name']} asset {rule['id']}: the stable upload "
                     "already exists; not uploading to beta"
                 )
                 needs_upload = False
@@ -1116,7 +1233,7 @@ def prepare_release(
             else:
                 result["promotion"] = (
                     channel == "stable"
-                    and upload_record(manifest, "beta").get("status") == "uploaded"
+                    and upload_record(manifest, "beta", asset_rule_id=rule["id"]).get("status") in {"uploaded", "staged"}
                 )
             if not needs_upload:
                 note = note_record(manifest, channel)
@@ -1124,7 +1241,7 @@ def prepare_release(
                     note.get("status") == "failed"
                     or note.get("body_sha256") != body_hash
                 ):
-                    result["sync_note"] = True
+                    result["sync_note"] = bool(resource_id)
                     result["record"] = True
                 elif not body and note.get("body_sha256") != body_hash:
                     result["note_outcome"] = "empty"
@@ -1132,7 +1249,7 @@ def prepare_release(
                 result["mirror_state"] = result.get("mirror_state", "already-uploaded")
                 return result
 
-    if latest_lookup is not None and not upload_allowed(release, channel, latest_lookup):
+    if latest_lookup is not None and not upload_allowed(release, channel, latest_lookup, product=product, rule=rule):
         result["mirror_state"] = "skipped-not-newer"
         return result
 
@@ -1166,10 +1283,12 @@ def prepare_release(
         }
     )
 
-    if manifest is not None and digest != (manifest.get("asset") or {}).get("sha256"):
-        raise RelayError(
-            f"source bytes for {release['tag_name']} differ from the recorded relay asset"
-        )
+    if manifest is not None:
+        rec = manifest.get("assets", {}).get(rule["id"]) or manifest.get("asset") or {}
+        if digest != rec.get("sha256"):
+            raise RelayError(
+                f"source bytes for {release['tag_name']} differ from the recorded relay asset"
+            )
 
     if not live:
         result["pending_reason"] = reason
@@ -1179,7 +1298,7 @@ def prepare_release(
         raise RelayError("relay client is required for a live import")
     if relay_release is None:
         manifest = build_manifest(
-            product_key, product, release, asset, size, digest, checksum_files, relay_tag, live
+            product_key, product, release, asset, rule, size, digest, checksum_files, relay_tag, live
         )
         created = relay.create_release(
             relay_repo,
@@ -1191,25 +1310,52 @@ def prepare_release(
         write_manifest(relay, relay_repo, created, manifest)
         result["relay_release_id"] = int(created["id"])
     else:
-        mirror = manifest.setdefault("mirror", {})
-        mirror["channel"] = channel
-        mirror.setdefault("uploads", {})[channel] = {
-            "status": "started",
+        # Existing relay release: update manifest with this asset or channel
+        mirror_top = manifest.setdefault("mirror", {})
+        mirror_top["channel"] = channel
+        mirror_top.setdefault("uploads", {})[channel] = {
+            "status": "started" if resource_id else "staged",
             "started_at": iso_now(),
             "run_url": os.environ.get("RELAY_RUN_URL"),
         }
+        assets_dict = manifest.setdefault("assets", {})
+        asset_rec = assets_dict.setdefault(rule["id"], {
+            "rule": rule["id"],
+            "source_asset_id": int(asset["id"]),
+            "name": asset["name"],
+            "size": int(size),
+            "sha256": digest,
+            "checksum_files": checksum_files,
+            "mirror": {
+                "resource_id": resource_id,
+                "os": rule["os"],
+                "arch": rule["arch"],
+                "uploads": {},
+            },
+        })
+        m_uploads = asset_rec.setdefault("mirror", {}).setdefault("uploads", {})
+        m_uploads[channel] = {
+            "status": "started" if resource_id else "staged",
+            "started_at": iso_now(),
+            "run_url": os.environ.get("RELAY_RUN_URL"),
+        }
+        # Upload asset file to relay release if not already present
+        existing_names = [a.get("name") for a in relay_release.get("assets") or []]
+        if str(asset["name"]) not in existing_names:
+            relay.upload_asset(relay_repo, int(relay_release["id"]), str(asset["name"]), destination)
         write_manifest(relay, relay_repo, relay_release, manifest)
+
     note = note_record(manifest, channel)
     result.update(
         {
-            "upload": True,
-            "sync_note": bool(body)
+            "upload": bool(resource_id),
+            "sync_note": bool(resource_id) and bool(body)
             and (
                 note.get("status") == "failed"
                 or note.get("body_sha256") != body_hash
             ),
             "record": True,
-            "mirror_state": "promotion" if result.get("promotion") else "started",
+            "mirror_state": "staged" if not resource_id else ("promotion" if result.get("promotion") else "started"),
         }
     )
     return result
@@ -1229,6 +1375,7 @@ def record_outcome(
     note_outcome: str,
     body_sha256: str | None,
     run_url: str | None,
+    asset_rule_id: str | None = None,
 ) -> dict[str, Any]:
     relay_release = relay.get_release_by_tag(relay_repo, relay_tag)
     if relay_release is None:
@@ -1252,6 +1399,23 @@ def record_outcome(
                 record["run_url"] = run_url
         else:
             record["status"] = "failed"
+    assets_dict = manifest.setdefault("assets", {})
+    target_rules = [asset_rule_id] if asset_rule_id else list(assets_dict.keys())
+    if not target_rules and manifest.get("asset", {}).get("rule"):
+        target_rules = [manifest["asset"]["rule"]]
+    for r_id in target_rules:
+        if r_id in assets_dict:
+            asset_mirror = assets_dict[r_id].setdefault("mirror", {})
+            asset_uploads = asset_mirror.setdefault("uploads", {})
+            if mirror_outcome in {"success", "failure"}:
+                rec = asset_uploads.setdefault(channel, {})
+                if mirror_outcome == "success":
+                    rec["status"] = "uploaded"
+                    rec["uploaded_at"] = iso_now()
+                    if run_url:
+                        rec["run_url"] = run_url
+                else:
+                    rec["status"] = "failed"
     note["channel"] = channel
     notes = note.setdefault("uploads", {})
     if note_outcome in {"success", "failure", "empty"}:
@@ -1296,12 +1460,50 @@ def fetch_mirror_latest(
         raise RelayError(f"MirrorChyan version check returned invalid JSON: {error}") from None
 
 
-VERSION_TAG_PATTERN = re.compile(r"^v(\d{4})\.(\d{1,4})\.(\d{1,6})(?:\..*)?$")
+SEMVER_PATTERN = re.compile(
+    r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+    r"(?:-([0-9a-zA-Z.-]+))?"
+    r"(?:\+([0-9a-zA-Z.-]+))?$"
+)
 
 
-def parse_version_tag(tag: str) -> tuple[int, int, int]:
+def parse_semver(tag: str) -> tuple[int, int, int, tuple[int, tuple]]:
+    m = SEMVER_PATTERN.match((tag or "").strip())
+    if not m:
+        raise RelayError(
+            f"cannot compare semver tag {tag!r}; expected "
+            "[v]MAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]"
+        )
+    major = int(m.group(1))
+    minor = int(m.group(2))
+    patch = int(m.group(3))
+    prerelease = m.group(4)
+    if prerelease is None:
+        prerelease_key = (1, ())
+    else:
+        parts = []
+        for part in prerelease.split("."):
+            if part.isdigit():
+                parts.append((0, int(part), ""))
+            else:
+                parts.append((1, 0, part))
+        prerelease_key = (0, tuple(parts))
+    return (major, minor, patch, prerelease_key)
+
+
+def is_semver_prerelease(tag: str) -> bool:
+    m = SEMVER_PATTERN.match((tag or "").strip())
+    if not m:
+        return False
+    return bool(m.group(4))
+
+
+VERSION_DATE_TAG_PATTERN = re.compile(r"^v?(\d{4})\.(\d{1,4})\.(\d{1,6})(?:\.(.*))?$")
+
+
+def parse_date_tag(tag: str) -> tuple[int, int, int]:
     """Parse ``v<year>.<mmdd>.<hhmmss>[.<suffix>]`` into comparable integers."""
-    match = VERSION_TAG_PATTERN.match(tag or "")
+    match = VERSION_DATE_TAG_PATTERN.match((tag or "").strip())
     if not match:
         raise RelayError(
             f"cannot compare version tag {tag!r}; expected "
@@ -1310,8 +1512,14 @@ def parse_version_tag(tag: str) -> tuple[int, int, int]:
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
 
 
-def version_is_newer(candidate: str, latest: str) -> bool:
-    return parse_version_tag(candidate) > parse_version_tag(latest)
+VERSION_TAG_PATTERN = VERSION_DATE_TAG_PATTERN
+parse_version_tag = parse_date_tag
+
+
+def version_is_newer(candidate: str, latest: str, scheme: str = "date-tag") -> bool:
+    if scheme == "semver":
+        return parse_semver(candidate) > parse_semver(latest)
+    return parse_date_tag(candidate) > parse_date_tag(latest)
 
 
 def mirror_latest_tag(
@@ -1319,14 +1527,19 @@ def mirror_latest_tag(
     product: dict[str, Any],
     channel: str,
     fetch: Callable[..., dict[str, Any]] = fetch_mirror_latest,
+    rule: dict[str, Any] | None = None,
 ) -> str | None:
     """Return the version MirrorChyan serves for a channel, or None when empty."""
-    rule = get_rule(product_key, product)
+    mirror = product.get("mirror") or {}
+    resource_id = (rule.get("resource_id") if rule else None) or mirror.get("resource_id")
+    if not resource_id:
+        return None
+    r = rule or get_rules(product_key, product)[0]
     payload = fetch(
-        str(product["mirror"]["resource_id"]),
+        str(resource_id),
         channel,
-        rule.get("query_os") or rule["os"],
-        rule.get("query_arch") or rule["arch"],
+        r.get("query_os") or r["os"],
+        r.get("query_arch") or r["arch"],
     )
     code = payload.get("code")
     if code == 0:
@@ -1345,14 +1558,33 @@ def mirror_latest_tag(
 def upload_allowed(
     release: dict[str, Any],
     channel: str,
-    latest_lookup: Callable[[str], str | None] | None,
+    latest_lookup: Callable[..., str | None] | None,
+    product: dict[str, Any] | None = None,
+    rule: dict[str, Any] | None = None,
 ) -> bool:
     if latest_lookup is None:
         return True
-    latest = latest_lookup(channel)
+    import inspect
+    sig = None
+    try:
+        sig = inspect.signature(latest_lookup)
+    except Exception:
+        pass
+    required_params = 1
+    if sig:
+        required_params = len([p for p, v in sig.parameters.items() if v.default == inspect.Parameter.empty])
+    if required_params == 1:
+        latest = latest_lookup(channel)
+    else:
+        rule_id = rule["id"] if rule else ""
+        try:
+            latest = latest_lookup(channel, rule_id)
+        except TypeError:
+            latest = latest_lookup(channel)
     if latest is None:
         return True
-    if version_is_newer(release["tag_name"], latest):
+    scheme = (product.get("version_scheme") or "date-tag") if product else "date-tag"
+    if version_is_newer(release["tag_name"], latest, scheme=scheme):
         return True
     log(
         f"skip upload for {release['tag_name']}: MirrorChyan {channel} "
@@ -1587,20 +1819,38 @@ def render_plan_summary(entries: list[dict[str, Any]], event: str, live: bool) -
     if not entries:
         lines.append("No release needs an upload or a note sync.")
         return "\n".join(lines) + "\n"
-    lines.extend(
-        [
-            "| product | release | tag | channel | action | reason |",
-            "| --- | --- | --- | --- | --- | --- |",
-        ]
-    )
-    for entry in entries:
-        tag = str(entry.get("tag") or "").replace("|", "\\|")
-        reason = str(entry.get("reason") or "").replace("|", "\\|")
-        lines.append(
-            f"| {entry['product']} | {entry['release_id']} | {tag} | "
-            f"{entry.get('channel', '')} | "
-            f"{entry['action']} | {reason} |"
+    has_assets = any("asset" in entry for entry in entries)
+    if has_assets:
+        lines.extend(
+            [
+                "| product | release | tag | channel | asset | action | reason |",
+                "| --- | --- | --- | --- | --- | --- | --- |",
+            ]
         )
+        for entry in entries:
+            tag = str(entry.get("tag") or "").replace("|", "\\|")
+            reason = str(entry.get("reason") or "").replace("|", "\\|")
+            asset_str = str(entry.get("asset") or "").replace("|", "\\|")
+            lines.append(
+                f"| {entry['product']} | {entry['release_id']} | {tag} | "
+                f"{entry.get('channel', '')} | {asset_str} | "
+                f"{entry['action']} | {reason} |"
+            )
+    else:
+        lines.extend(
+            [
+                "| product | release | tag | channel | action | reason |",
+                "| --- | --- | --- | --- | --- | --- |",
+            ]
+        )
+        for entry in entries:
+            tag = str(entry.get("tag") or "").replace("|", "\\|")
+            reason = str(entry.get("reason") or "").replace("|", "\\|")
+            lines.append(
+                f"| {entry['product']} | {entry['release_id']} | {tag} | "
+                f"{entry.get('channel', '')} | "
+                f"{entry['action']} | {reason} |"
+            )
     if not live and event == "schedule":
         lines.extend(
             [
@@ -1647,17 +1897,25 @@ def cmd_plan(args: argparse.Namespace) -> int:
     for key in keys:
         product = get_product(config, key)
         source = client_for_product(product)
-        cache: dict[str, str | None] = {}
+        cache: dict[tuple[str, str], str | None] = {}
 
         def lookup(
             channel: str,
+            rule_id: str = "",
             _key: str = key,
             _product: dict = product,
-            _cache: dict[str, str | None] = cache,
+            _cache: dict[tuple[str, str], str | None] = cache,
         ) -> str | None:
-            if channel not in _cache:
-                _cache[channel] = mirror_latest_tag(_key, _product, channel)
-            return _cache[channel]
+            rule_obj = None
+            if rule_id:
+                try:
+                    rule_obj = get_rule(_key, _product, rule_id)
+                except RelayError:
+                    pass
+            k = (channel, rule_id)
+            if k not in _cache:
+                _cache[k] = mirror_latest_tag(_key, _product, channel, rule=rule_obj)
+            return _cache[k]
 
         entries.extend(
             plan_releases(
@@ -1677,6 +1935,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
             {
                 "product": entry["product"],
                 "release_id": entry["release_id"],
+                "asset": entry.get("asset", ""),
                 "tag": entry["tag"],
                 "action": entry["action"],
                 "reason": entry["reason"],
@@ -1716,8 +1975,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
     )
     log(summary)
     for entry in entries:
+        asset_info = f" asset={entry['asset']}" if entry.get("asset") else ""
         log(
-            f"{entry['product']} {entry['tag']} ({entry['release_id']}): "
+            f"{entry['product']} {entry['tag']} ({entry['release_id']}){asset_info}: "
             f"{entry['action']} [{entry['reason']}]"
         )
     return 0
@@ -1732,14 +1992,21 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     relay: GitHubClient | None = None
     if live:
         relay = relay_client()
-    latest_lookup: Callable[[str], str | None] | None = None
+    latest_lookup: Callable[[str, str], str | None] | None = None
     if args.action in {"import", "promote"}:
-        latest_cache: dict[str, str | None] = {}
+        latest_cache: dict[tuple[str, str], str | None] = {}
 
-        def latest_for(channel: str) -> str | None:
-            if channel not in latest_cache:
-                latest_cache[channel] = mirror_latest_tag(args.product, product, channel)
-            return latest_cache[channel]
+        def latest_for(channel: str, rule_id: str = "") -> str | None:
+            k = (channel, rule_id)
+            if k not in latest_cache:
+                rule_obj = None
+                if rule_id:
+                    try:
+                        rule_obj = get_rule(args.product, product, rule_id)
+                    except RelayError:
+                        pass
+                latest_cache[k] = mirror_latest_tag(args.product, product, channel, rule=rule_obj)
+            return latest_cache[k]
 
         latest_lookup = latest_for
     result = prepare_release(
@@ -1752,6 +2019,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         args.action,
         live,
         Path(args.staging_dir),
+        asset_rule_id=getattr(args, "asset", None),
         reason=args.reason or "",
         wait_timeout=args.wait_timeout,
         wait_interval=args.wait_interval,
@@ -1769,10 +2037,12 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             "upload": str(bool(result.get("upload"))).lower(),
             "sync_note": str(bool(result.get("sync_note"))).lower(),
             "record": str(bool(result.get("record"))).lower(),
+            "asset": result.get("asset") or "",
             "asset_path": result.get("asset_path"),
             "version_name": result["version_name"],
             "channel": result["channel"],
-            "resource_id": result["resource_id"],
+            "resource_id": result.get("resource_id") or "",
+            "staging_only": str(bool(result.get("staging_only"))).lower(),
             "os": result["os"],
             "arch": result["arch"],
             "query_os": result["query_os"],
@@ -1813,6 +2083,7 @@ def cmd_record(args: argparse.Namespace) -> int:
         args.note_outcome or "skipped",
         args.body_sha256,
         args.run_url,
+        asset_rule_id=getattr(args, "asset", None),
     )
     log(
         f"recorded {args.relay_tag} {args.channel}: "
@@ -1871,6 +2142,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare = subparsers.add_parser("prepare", help="download, verify and stage one release")
     prepare.add_argument("--product", required=True)
     prepare.add_argument("--release-id", type=int, required=True)
+    prepare.add_argument("--asset", help="Asset rule id")
     prepare.add_argument(
         "--action", default="import", choices=["import", "promote", "note", "attention"]
     )
@@ -1886,6 +2158,7 @@ def build_parser() -> argparse.ArgumentParser:
     record = subparsers.add_parser("record", help="store MirrorChyan outcomes")
     record.add_argument("--product", required=True)
     record.add_argument("--release-id", type=int, required=True)
+    record.add_argument("--asset", help="Asset rule id")
     record.add_argument("--relay-tag", required=True)
     record.add_argument("--channel", required=True, choices=["stable", "beta"])
     record.add_argument("--mirror-outcome", default="skipped")

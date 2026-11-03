@@ -127,19 +127,25 @@ jobs:
           RELAY_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           PRODUCT: ${{ matrix.product }}
           RELEASE_ID: ${{ matrix.release_id }}
+          ASSET: ${{ matrix.asset }}
           ACTION: ${{ matrix.action }}
           REASON: ${{ matrix.reason }}
           LIVE: ${{ needs.plan.outputs.live }}
         run: |
-          python scripts/relay_release.py prepare \
-            --product "$PRODUCT" \
-            --release-id "$RELEASE_ID" \
-            --action "$ACTION" \
-            --reason "$REASON" \
-            --live "$LIVE" \
-            --staging-dir staging \
-            --json-out "staging/${PRODUCT}-${RELEASE_ID}-result.json" \
+          args=(
+            --product "$PRODUCT"
+            --release-id "$RELEASE_ID"
+            --action "$ACTION"
+            --reason "$REASON"
+            --live "$LIVE"
+            --staging-dir staging
+            --json-out "staging/${PRODUCT}-${RELEASE_ID}${ASSET:+-$ASSET}-result.json"
             --github-output "$GITHUB_OUTPUT"
+          )
+          if [[ -n "$ASSET" ]]; then
+            args+=(--asset "$ASSET")
+          fi
+          python scripts/relay_release.py prepare "${args[@]}"
 
       - name: Upload package to MirrorChyan
         id: mirror
@@ -213,6 +219,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           PRODUCT: ${{ matrix.product }}
           RELEASE_ID: ${{ matrix.release_id }}
+          ASSET: ${{ steps.prepare.outputs.asset }}
           RELAY_TAG: ${{ steps.prepare.outputs.relay_tag }}
           CHANNEL: ${{ steps.prepare.outputs.channel }}
           MIRROR_OUTCOME: ${{ steps.verify.outcome }}
@@ -220,12 +227,17 @@ jobs:
           BODY_SHA256: ${{ steps.prepare.outputs.body_sha256 }}
           RELAY_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          python scripts/relay_release.py record \
-            --product "$PRODUCT" \
-            --release-id "$RELEASE_ID" \
-            --relay-tag "$RELAY_TAG" \
-            --channel "$CHANNEL" \
-            --mirror-outcome "$MIRROR_OUTCOME" \
-            --note-outcome "$NOTE_OUTCOME" \
-            --body-sha256 "$BODY_SHA256" \
+          args=(
+            --product "$PRODUCT"
+            --release-id "$RELEASE_ID"
+            --relay-tag "$RELAY_TAG"
+            --channel "$CHANNEL"
+            --mirror-outcome "$MIRROR_OUTCOME"
+            --note-outcome "$NOTE_OUTCOME"
+            --body-sha256 "$BODY_SHA256"
             --run-url "$RELAY_RUN_URL"
+          )
+          if [[ -n "$ASSET" ]]; then
+            args+=(--asset "$ASSET")
+          fi
+          python scripts/relay_release.py record "${args[@]}"

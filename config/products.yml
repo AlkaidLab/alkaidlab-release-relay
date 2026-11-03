@@ -5,6 +5,7 @@ relay:
 products:
   foundation-sunshine:
     display_name: Foundation Sunshine
+    version_scheme: date-tag
     source:
       kind: github
       repository: AlkaidLab/foundation-sunshine
@@ -22,18 +23,128 @@ products:
       assets:
         - checksums.json
         - SHA256SUMS.txt
-    # One asset rule per product. Independent resource streams get their own
-    # product key and official MirrorChyan resource ID.
     assets:
       - id: windows-installer
         source_pattern: 'Sunshine.*.WindowsInstaller.exe'
-        # Values sent to the upload action (resource configuration).
         os: win
         arch: x64
-        # Values used when querying the public version API.
         query_os: windows
         query_arch: amd64
         resource_type: exec
 
-# Add other products only after MirrorChyan supplies their official resource ID,
-# platform/architecture mapping, and channel policy.
+  moonlight-vplus:
+    display_name: Moonlight V+ (Android)
+    version_scheme: semver
+    source:
+      kind: github
+      repository: qiin2333/moonlight-vplus
+      public: true
+    mirror:
+      resource_id: null
+    asset_wait:
+      timeout_seconds: 600
+      interval_seconds: 15
+    checksums:
+      assets: []
+    assets:
+      - id: android-apk
+        source_pattern: 'Moonlight.V+.*.apk'
+        os: android
+        arch: arm64
+        resource_type: exec
+
+  moonlight-vplus-pc:
+    display_name: Moonlight V+ (PC)
+    version_scheme: semver
+    source:
+      kind: github
+      repository: qiin2333/moonlight-qt
+      public: true
+    mirror:
+      resource_id: null
+    asset_wait:
+      timeout_seconds: 600
+      interval_seconds: 15
+    checksums:
+      assets: []
+    assets:
+      - id: windows-x64-installer
+        source_pattern: 'Moonlight-VPlus-Setup-*.exe'
+        os: win
+        arch: x64
+        query_os: windows
+        query_arch: amd64
+        resource_type: exec
+      - id: windows-x64-portable
+        source_pattern: 'Moonlight-VPlus-Portable-x64-*.zip'
+        os: win
+        arch: x64
+        query_os: windows
+        query_arch: amd64
+        resource_type: zip
+      - id: windows-arm64-portable
+        source_pattern: 'Moonlight-VPlus-Portable-arm64-*.zip'
+        os: win
+        arch: arm64
+        query_os: windows
+        query_arch: arm64
+        resource_type: zip
+      - id: macos-arm64-dmg
+        source_pattern: 'Moonlight-VPlus-*-arm64.dmg'
+        os: osx
+        arch: arm64
+        query_os: mac
+        query_arch: arm64
+        resource_type: exec
+      - id: linux-x64-appimage
+        source_pattern: 'Moonlight-VPlus-*-x86_64.AppImage'
+        os: linux
+        arch: x64
+        query_os: linux
+        query_arch: amd64
+        resource_type: exec
+      - id: linux-arm64-appimage
+        source_pattern: 'Moonlight-VPlus-*-aarch64.AppImage'
+        os: linux
+        arch: arm64
+        query_os: linux
+        query_arch: arm64
+        resource_type: exec
+
+  moonlight-macos-enhanced:
+    display_name: Moonlight for macOS Enhanced
+    version_scheme: semver
+    source:
+      kind: github
+      repository: skyhua0224/moonlight-macos-enhanced
+      public: true
+    mirror:
+      resource_id: null
+    asset_wait:
+      timeout_seconds: 600
+      interval_seconds: 15
+    checksums:
+      assets:
+        - SHA256SUMS
+    assets:
+      - id: macos-universal-dmg
+        source_pattern: 'Moonlight-macOS-Enhanced-universal.dmg'
+        os: osx
+        arch: universal
+        query_os: mac
+        query_arch: universal
+        resource_type: exec
+      - id: macos-arm64-dmg
+        source_pattern: 'Moonlight-macOS-Enhanced-arm64.dmg'
+        os: osx
+        arch: arm64
+        query_os: mac
+        query_arch: arm64
+        resource_type: exec
+      - id: macos-x64-dmg
+        source_pattern: 'Moonlight-macOS-Enhanced-x86_64.dmg'
+        os: osx
+        arch: x64
+        query_os: mac
+        query_arch: amd64
+        resource_type: exec
