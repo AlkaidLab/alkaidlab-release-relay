@@ -374,8 +374,12 @@ def get_rule(product_key: str, product: dict[str, Any]) -> dict[str, Any]:
 
 
 def relay_repository(config: dict[str, Any]) -> str:
-    repository = os.environ.get("RELAY_REPOSITORY") or (config.get("relay") or {}).get(
-        "repository"
+    # Inside Actions the running repository is authoritative, so a rename never
+    # breaks the relay; the config value is the fallback for local runs.
+    repository = (
+        os.environ.get("RELAY_REPOSITORY")
+        or os.environ.get("GITHUB_REPOSITORY")
+        or (config.get("relay") or {}).get("repository")
     )
     if not repository:
         raise RelayError("relay.repository is not configured")

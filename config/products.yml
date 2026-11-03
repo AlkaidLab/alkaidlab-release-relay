@@ -1,6 +1,6 @@
 relay:
   # Repository that stores the namespaced relay releases and manifests.
-  repository: AlkaidLab/release-relay
+  repository: AlkaidLab/alkaidlab-release-relay
 
 products:
   foundation-sunshine:

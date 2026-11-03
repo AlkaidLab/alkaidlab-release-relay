@@ -139,14 +139,14 @@ merge it; close it instead.
 - The resource ID and token are unchanged: `foundation-sunshine`, Windows x64,
   `exec` installer, channel `stable` for a normal release and `beta` for a
   pre-release.
-- `MirrorChyanUploadToken` will be configured in `AlkaidLab/release-relay`, not
+- `MirrorChyanUploadToken` will be configured in `AlkaidLab/alkaidlab-release-relay`, not
   in the source repository.
 - The relay uploads the original source tag as the version name, for example
   `v2026.1031.121458.杂鱼`.
 - Releases continue to be published on GitHub; `AlkaidLab/foundation-sunshine`
   needs no workflow change and no secret.
 - Ask MirrorChyan to confirm that the token is valid for uploads from
-  `AlkaidLab/release-relay` and that `foundation-sunshine` still accepts
+  `AlkaidLab/alkaidlab-release-relay` and that `foundation-sunshine` still accepts
   `os=win`, `arch=x64`.
 - Tell them that `uploading-action@v1` cannot upload a non-ASCII version name on
   Linux because of the `Content-Disposition` header, so the relay calls the
