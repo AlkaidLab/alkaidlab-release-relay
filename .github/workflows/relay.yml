@@ -1,0 +1,209 @@
+name: Relay release import
+
+on:
+  workflow_dispatch:
+    inputs:
+      product:
+        description: Product key from config/products.yml
+        required: true
+        default: foundation-sunshine
+        type: string
+      tag:
+        description: Exact source tag; empty processes every pending or edited release
+        required: false
+        default: ''
+        type: string
+      dry_run:
+        description: Download and verify without relay or MirrorChyan writes
+        required: true
+        default: true
+        type: boolean
+  schedule:
+    - cron: '*/15 * * * *'
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+
+concurrency:
+  group: relay-import
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      live: ${{ steps.plan.outputs.live }}
+      has_work: ${{ steps.plan.outputs.has_work }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Checkout relay
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check pyyaml requests
+
+      - name: Remove transient upload artifacts
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+            --jq '.artifacts[].id' > "${RUNNER_TEMP}/relay-artifacts.txt"
+          while read -r artifact_id; do
+            if [[ -n "$artifact_id" ]]; then
+              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}"
+            fi
+          done < "${RUNNER_TEMP}/relay-artifacts.txt"
+
+      - name: Plan releases
+        id: plan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELAY_SOURCE_TOKEN: ${{ secrets.RELAY_SOURCE_TOKEN }}
+          PRODUCT: ${{ inputs.product }}
+          TAG: ${{ inputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          RELAY_LIVE: ${{ vars.RELAY_LIVE }}
+        run: |
+          args=(
+            --event "$EVENT_NAME"
+            --dry-run "$DRY_RUN"
+            --relay-live "$RELAY_LIVE"
+            --json-out out/plan.json
+            --summary-out out/plan.md
+            --github-output "$GITHUB_OUTPUT"
+          )
+          if [[ -n "$PRODUCT" ]]; then
+            args+=(--product "$PRODUCT")
+          fi
+          if [[ -n "$TAG" ]]; then
+            args+=(--tag "$TAG")
+          fi
+          python scripts/relay_release.py plan "${args[@]}"
+          cat out/plan.md >> "$GITHUB_STEP_SUMMARY"
+
+  import:
+    needs: plan
+    if: needs.plan.outputs.has_work == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+      issues: write
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Checkout relay
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check pyyaml requests
+
+      - name: Prepare release
+        id: prepare
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELAY_SOURCE_TOKEN: ${{ secrets.RELAY_SOURCE_TOKEN }}
+          RELAY_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PRODUCT: ${{ matrix.product }}
+          RELEASE_ID: ${{ matrix.release_id }}
+          ACTION: ${{ matrix.action }}
+          REASON: ${{ matrix.reason }}
+          LIVE: ${{ needs.plan.outputs.live }}
+        run: |
+          python scripts/relay_release.py prepare \
+            --product "$PRODUCT" \
+            --release-id "$RELEASE_ID" \
+            --action "$ACTION" \
+            --reason "$REASON" \
+            --live "$LIVE" \
+            --staging-dir staging \
+            --json-out "staging/${PRODUCT}-${RELEASE_ID}-result.json" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Upload package to MirrorChyan
+        id: mirror
+        if: steps.prepare.outputs.upload == 'true'
+        continue-on-error: true
+        env:
+          MIRROR_UPLOAD_TOKEN: ${{ secrets.MirrorChyanUploadToken }}
+          RID: ${{ steps.prepare.outputs.resource_id }}
+          VERSION: ${{ steps.prepare.outputs.version_name }}
+          CHANNEL: ${{ steps.prepare.outputs.channel }}
+          UPLOAD_OS: ${{ steps.prepare.outputs.os }}
+          UPLOAD_ARCH: ${{ steps.prepare.outputs.arch }}
+          ASSET_PATH: ${{ steps.prepare.outputs.asset_path }}
+        run: |
+          python scripts/relay_release.py upload-mirror \
+            --rid "$RID" \
+            --version "$VERSION" \
+            --channel "$CHANNEL" \
+            --os "$UPLOAD_OS" \
+            --arch "$UPLOAD_ARCH" \
+            --file "$ASSET_PATH"
+
+      - name: Verify published version
+        id: verify
+        if: steps.prepare.outputs.upload == 'true'
+        env:
+          RID: ${{ steps.prepare.outputs.resource_id }}
+          VERSION: ${{ steps.prepare.outputs.version_name }}
+          CHANNEL: ${{ steps.prepare.outputs.channel }}
+          QUERY_OS: ${{ steps.prepare.outputs.query_os }}
+          QUERY_ARCH: ${{ steps.prepare.outputs.query_arch }}
+          UPLOAD_OUTCOME: ${{ steps.mirror.outcome }}
+        run: |
+          python scripts/relay_release.py verify-mirror \
+            --rid "$RID" \
+            --version "$VERSION" \
+            --channel "$CHANNEL" \
+            --os "$QUERY_OS" \
+            --arch "$QUERY_ARCH" \
+            --action-outcome "$UPLOAD_OUTCOME"
+
+      - name: Sync release note
+        id: note
+        if: steps.prepare.outputs.sync_note == 'true'
+        uses: MirrorChyan/release-note-action@v1
+        with:
+          mirrorchyan_rid: ${{ steps.prepare.outputs.resource_id }}
+          version_name: ${{ steps.prepare.outputs.version_name }}
+          channel: ${{ steps.prepare.outputs.channel }}
+          release_note: ${{ steps.prepare.outputs.release_note }}
+          upload_token: ${{ secrets.MirrorChyanUploadToken }}
+
+      - name: Record relay state
+        if: always() && steps.prepare.outputs.record == 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PRODUCT: ${{ matrix.product }}
+          RELEASE_ID: ${{ matrix.release_id }}
+          RELAY_TAG: ${{ steps.prepare.outputs.relay_tag }}
+          MIRROR_OUTCOME: ${{ steps.verify.outcome }}
+          NOTE_OUTCOME: ${{ steps.note.outcome }}
+          BODY_SHA256: ${{ steps.prepare.outputs.body_sha256 }}
+          RELAY_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python scripts/relay_release.py record \
+            --product "$PRODUCT" \
+            --release-id "$RELEASE_ID" \
+            --relay-tag "$RELAY_TAG" \
+            --mirror-outcome "$MIRROR_OUTCOME" \
+            --note-outcome "$NOTE_OUTCOME" \
+            --body-sha256 "$BODY_SHA256" \
+            --run-url "$RELAY_RUN_URL"

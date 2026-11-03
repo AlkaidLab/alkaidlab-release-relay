@@ -1,3 +1,4 @@
 out/
+staging/
 __pycache__/
 .venv/

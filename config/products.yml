@@ -1,17 +1,38 @@
+relay:
+  # Repository that stores the namespaced relay releases and manifests.
+  repository: AlkaidLab/release-relay
+
 products:
   foundation-sunshine:
     display_name: Foundation Sunshine
     source:
       kind: github
       repository: AlkaidLab/foundation-sunshine
+      # Public sources are read without a token so a relay workflow token never
+      # has to cross repository boundaries. Private sources need
+      # RELAY_SOURCE_TOKEN.
+      public: true
     mirror:
-      # Supplied by the MirrorChyan integration PR/configuration.
       resource_id: foundation-sunshine
+    asset_wait:
+      # The release event can arrive before its assets finish uploading.
+      timeout_seconds: 600
+      interval_seconds: 15
+    checksums:
+      assets:
+        - checksums.json
+        - SHA256SUMS.txt
+    # One asset rule per product. Independent resource streams get their own
+    # product key and official MirrorChyan resource ID.
     assets:
       - id: windows-installer
         source_pattern: 'Sunshine.*.WindowsInstaller.exe'
+        # Values sent to the upload action (resource configuration).
         os: win
         arch: x64
+        # Values used when querying the public version API.
+        query_os: windows
+        query_arch: amd64
         resource_type: exec
 
 # Add other products only after MirrorChyan supplies their official resource ID,
