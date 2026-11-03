@@ -101,10 +101,10 @@ records:
 - the asset rule, source asset id, name, size, SHA256 and the checksum files that
   agreed;
 - the relay tag and creation time;
-- MirrorChyan resource, version name, channel, os, arch, and the upload state
-  (`started`, `uploaded`, `failed`);
-- the note state (`pending`, `synced`, `failed`, `empty`) and the body hash that
-  was sent.
+- MirrorChyan resource, version name, os, arch, and an `uploads` map keyed by
+  channel (`stable`, `beta`), each with `started`, `uploaded` or `failed`;
+- a note `uploads` map keyed by channel, each with `synced`, `failed` or `empty`
+  and the body hash that was sent.
 
 There is no committed state file and no Actions artifact dependency. Listing
 relay Releases plus reading their small manifests is enough to plan the next run.
@@ -112,16 +112,23 @@ relay Releases plus reading their small manifests is enough to plan the next run
 The upload is guarded by the manifest, not by retry heuristics:
 
 - No relay Release: download, verify, create, upload.
-- Manifest `uploaded`: never upload this source release and asset again.
+- Manifest has an `uploaded` record for the current channel: never upload this
+  source release and asset to that channel again.
+- Manifest has a `beta` upload but no `stable` upload and the source is now a
+  normal release: upload once to `stable` (promotion) and sync the stable note.
+- Manifest has a `stable` upload but no `beta` upload and the source is now a
+  pre-release: log the demotion and do not upload.
 - Manifest `started` or `failed`: flag the release for manual review rather than
   risk a second upload. The operator deletes the relay Release only after
   confirming with MirrorChyan that the version is absent.
 - Source asset id or size differs from the manifest: flag the release; the bytes
   changed under the same source release.
 
-The plan job is also the place where body edits are detected. It compares the
-manifest's body hash with the current source body; an edit produces a note-only
-entry.
+The plan job is also the place where body edits and promotions are detected. It
+compares the manifest's note hash for the current channel with the source body;
+an edit produces a note-only entry. It compares the source `prerelease` flag with
+the recorded channel uploads; a pre-release that became normal produces one
+stable upload entry.
 
 ## Import job phases
 

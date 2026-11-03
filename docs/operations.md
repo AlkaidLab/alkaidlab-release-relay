@@ -50,6 +50,13 @@ A rerun is safe by design:
   flagged for manual review. The relay does not upload twice automatically
   because it cannot prove that an interrupted attempt never reached MirrorChyan.
 
+Upload records are kept per channel. A release uploaded to `beta` and later
+published as `prerelease=false` is planned once for `stable`: the same verified
+bytes are uploaded with `channel=stable`, the stable note is synced, and the
+manifest keeps both channel records. Rerunning that release is a no-op. A
+release that goes back to `prerelease=true` after a stable upload is a demotion;
+the relay logs `demotion ignored` and does not upload it to `beta` again.
+
 ## Roll back
 
 There are two layers.
@@ -97,6 +104,13 @@ The plan job still deletes artifacts in this repository at the start of each
 run; the note action creates a small `body.json` artifact. Artifacts are not
 part of the relay's recovery path; relay Releases and MirrorChyan storage are.
 
+For comparison, dispatch with `use_official_action=true`. That sends the import
+job to `macos-latest`, where the reference PR #1197 proved the vendor uploader
+works, and uses `MirrorChyan/uploading-action@v1` with `filetype: local` for the
+package. The default (`false`) uses the relay client on `ubuntu-latest`. Do not
+run both modes for the same release: the per-channel record prevents the relay
+client from uploading twice, but the vendor action does not consult it.
+
 ## What to tell MirrorChyan
 
 PR #1197 on `AlkaidLab/foundation-sunshine` is replaced by this relay. Do not
@@ -117,6 +131,25 @@ merge it; close it instead.
 - Tell them that `uploading-action@v1` cannot upload a non-ASCII version name on
   Linux because of the `Content-Disposition` header, so the relay calls the
   version API directly. A fix in the action would let the relay return to it.
+
+Bug report text for MirrorChyan:
+
+```text
+Title: uploading-action@v1 fails for non-ASCII version names on Linux
+
+`python/upload.py` sends Content-Disposition with the raw download file name:
+
+  Content-Disposition: attachment; filename="<rid>-<version>-<os>-<arch><ext>"
+
+CPython's http.client encodes header values as Latin-1, so a version such as
+v2026.1031.121458.杂鱼 raises UnicodeEncodeError before the object upload. This
+reproduces on ubuntu-latest with requests 2.34.2, urllib3 2.8.0 and CPython
+3.14.6; the same request succeeds on the macOS runner used by the reference PR.
+
+Encoding the parameter as RFC 6266/5987 (filename="..."; filename*=UTF-8''...)
+keeps the header ASCII and works on both runners. The JSON release-note upload
+is not affected.
+```
 
 ## Troubleshooting
 

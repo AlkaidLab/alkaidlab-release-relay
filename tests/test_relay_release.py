@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -247,8 +248,9 @@ def add_relay_release(
     tag = relay.build_relay_tag("foundation-sunshine", release["tag_name"], release["id"])
     created = fake.create_release(RELAY_REPO, tag, "relay", "manifest")
     asset = release["assets"][0]
+    channel = relay.channel_for(release)
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "product": "foundation-sunshine",
         "source": {
             "kind": "github",
@@ -264,23 +266,30 @@ def add_relay_release(
             "source_asset_id": source_asset_id or asset["id"],
             "name": asset["name"],
             "size": asset["size"],
-            "sha256": "0" * 64,
+            "sha256": hashlib.sha256(
+                fake.files[asset["browser_download_url"]]
+            ).hexdigest(),
             "checksum_files": [],
         },
         "relay": {"tag": tag, "created_at": "2026-11-01T00:00:00Z"},
         "mirror": {
             "resource_id": "foundation-sunshine",
             "version_name": release["tag_name"],
-            "channel": relay.channel_for(release),
+            "channel": channel,
             "os": "win",
             "arch": "x64",
-            "status": mirror_status,
+            "uploads": {channel: {"status": mirror_status}},
         },
         "note": {
-            "status": note_status,
-            "body_sha256": note_sha
-            if note_sha is not None
-            else relay.text_sha256(release["body"]),
+            "channel": channel,
+            "uploads": {
+                channel: {
+                    "status": note_status,
+                    "body_sha256": note_sha
+                    if note_sha is not None
+                    else relay.text_sha256(release["body"]),
+                }
+            },
         },
     }
     fake.upload_asset_bytes(
@@ -520,14 +529,13 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual("attention", entries[0]["action"])
         self.assertIn("0 assets named", entries[0]["reason"])
 
-    def test_dry_dispatch_keeps_import_for_known_release(self) -> None:
+    def test_dry_dispatch_reports_nothing_for_complete_release(self) -> None:
         known = add_source_release(self.fake, 200, "v2", body="old")
         add_relay_release(self.fake, known)
         entries = relay.plan_releases(
             make_config(), self.fake, self.fake, RELAY_REPO, tag="v2", dry_run=True
         )
-        self.assertEqual(1, len(entries))
-        self.assertEqual("dry-run", entries[0]["reason"])
+        self.assertEqual([], entries)
 
     def test_live_dispatch_plans_import_for_missing_relay_release(self) -> None:
         add_source_release(self.fake, 200, "v2")
@@ -571,6 +579,63 @@ class PlanningTests(unittest.TestCase):
     def test_unknown_product_is_refused(self) -> None:
         with self.assertRaisesRegex(relay.RelayError, "unknown product"):
             relay.get_product(make_config(), "other-product")
+
+    def _promotion(self) -> dict:
+        release = add_source_release(self.fake, 200, "v2", prerelease=True, body="notes")
+        add_relay_release(self.fake, release)
+        self.fake.repositories[SOURCE_REPO][200]["prerelease"] = False
+        return release
+
+    def test_promotion_plans_one_stable_upload(self) -> None:
+        self._promotion()
+        entries = relay.plan_releases(
+            make_config(), self.fake, self.fake, RELAY_REPO
+        )
+        self.assertEqual(1, len(entries))
+        self.assertEqual(
+            (200, "promote", "promotion", "stable"),
+            (
+                entries[0]["release_id"],
+                entries[0]["action"],
+                entries[0]["reason"],
+                entries[0]["channel"],
+            ),
+        )
+
+    def test_promotion_rerun_is_noop(self) -> None:
+        release = self._promotion()
+        tag = relay.build_relay_tag("foundation-sunshine", release["tag_name"], release["id"])
+        relay.record_outcome(
+            self.fake, RELAY_REPO, 200, tag, "stable", "success", "success",
+            relay.text_sha256(release["body"]), None,
+        )
+        entries = relay.plan_releases(
+            make_config(), self.fake, self.fake, RELAY_REPO
+        )
+        self.assertEqual([], entries)
+
+    def test_demotion_is_logged_not_uploaded(self) -> None:
+        release = add_source_release(self.fake, 200, "v2", prerelease=False)
+        add_relay_release(self.fake, release)
+        self.fake.repositories[SOURCE_REPO][200]["prerelease"] = True
+        with mock.patch.object(relay, "log") as log:
+            entries = relay.plan_releases(
+                make_config(), self.fake, self.fake, RELAY_REPO
+            )
+        self.assertEqual([], entries)
+        self.assertTrue(
+            any("demotion ignored" in str(call) for call in log.call_args_list)
+        )
+
+    def test_dry_run_reports_promotion(self) -> None:
+        self._promotion()
+        entries = relay.plan_releases(
+            make_config(), self.fake, self.fake, RELAY_REPO, tag="v2", dry_run=True
+        )
+        self.assertEqual(1, len(entries))
+        self.assertEqual("promote", entries[0]["action"])
+        self.assertEqual("promotion", entries[0]["reason"])
+        self.assertTrue(entries[0]["dry_run"])
 
 
 class ImportTests(unittest.TestCase):
@@ -622,7 +687,7 @@ class ImportTests(unittest.TestCase):
                 if name == "relay-manifest.json"
             )
         )
-        self.assertEqual("started", doc["mirror"]["status"])
+        self.assertEqual("started", doc["mirror"]["uploads"]["stable"]["status"])
         self.assertEqual(self.release["id"], doc["source"]["release_id"])
 
     def test_import_is_idempotent_after_upload(self) -> None:
@@ -632,7 +697,8 @@ class ImportTests(unittest.TestCase):
             relay.build_relay_tag(
                 "foundation-sunshine", self.release["tag_name"], self.release["id"]
             ),
-            "success", "success", relay.text_sha256(self.release["body"]), None,
+            "stable", "success", "success",
+            relay.text_sha256(self.release["body"]), None,
         )
         downloads_before = len(self.fake.downloads)
         uploads_before = len(self.fake.uploads)
@@ -661,7 +727,8 @@ class ImportTests(unittest.TestCase):
             relay.build_relay_tag(
                 "foundation-sunshine", self.release["tag_name"], self.release["id"]
             ),
-            "success", "success", relay.text_sha256(self.release["body"]), None,
+            "stable", "success", "success",
+            relay.text_sha256(self.release["body"]), None,
         )
         self.fake.repositories[SOURCE_REPO][self.release["id"]]["body"] = "new body"
         downloads_before = len(self.fake.downloads)
@@ -669,6 +736,97 @@ class ImportTests(unittest.TestCase):
         self.assertFalse(result["upload"])
         self.assertTrue(result["sync_note"])
         self.assertEqual(downloads_before, len(self.fake.downloads))
+
+    def _promoted_release(self, release_id: int = 300) -> dict:
+        release = add_source_release(
+            self.fake, release_id, "v3", prerelease=True, body="promoted notes"
+        )
+        add_relay_release(self.fake, release)
+        self.fake.repositories[SOURCE_REPO][release_id]["prerelease"] = False
+        return release
+
+    def test_prepare_promotion_marks_stable_without_reuploading_asset(self) -> None:
+        release = self._promoted_release()
+        downloads_before = len(self.fake.downloads)
+        result = relay.prepare_release(
+            self.config, self.fake, self.fake, RELAY_REPO,
+            "foundation-sunshine", 300, "promote", True, self.staging,
+            sleep=lambda _: None, clock=lambda: 0.0,
+        )
+        self.assertTrue(result["upload"])
+        self.assertEqual("promotion", result["mirror_state"])
+        self.assertTrue(result["sync_note"])
+        installer_uploads = [item for item in self.fake.uploads if item[1].endswith(".exe")]
+        self.assertEqual(1, len(installer_uploads))
+        self.assertEqual(downloads_before + 1, len(self.fake.downloads))
+        tag = relay.build_relay_tag("foundation-sunshine", release["tag_name"], release["id"])
+        relay_release = self.fake.get_release_by_tag(RELAY_REPO, tag)
+        manifest = relay.migrate_manifest(
+            relay.read_manifest(self.fake, RELAY_REPO, relay_release)
+        )
+        self.assertEqual("uploaded", relay.upload_record(manifest, "beta")["status"])
+        self.assertEqual("started", relay.upload_record(manifest, "stable")["status"])
+
+    def test_prepare_promotion_rerun_is_noop(self) -> None:
+        release = self._promoted_release(301)
+        relay.prepare_release(
+            self.config, self.fake, self.fake, RELAY_REPO,
+            "foundation-sunshine", 301, "promote", True, self.staging,
+            sleep=lambda _: None, clock=lambda: 0.0,
+        )
+        tag = relay.build_relay_tag("foundation-sunshine", release["tag_name"], release["id"])
+        relay.record_outcome(
+            self.fake, RELAY_REPO, 301, tag, "stable", "success", "success",
+            relay.text_sha256(release["body"]), None,
+        )
+        downloads_before = len(self.fake.downloads)
+        result = relay.prepare_release(
+            self.config, self.fake, self.fake, RELAY_REPO,
+            "foundation-sunshine", 301, "promote", True, self.staging,
+            sleep=lambda _: None, clock=lambda: 0.0,
+        )
+        self.assertFalse(result["upload"])
+        self.assertEqual("already-uploaded", result["mirror_state"])
+        self.assertEqual(downloads_before, len(self.fake.downloads))
+
+    def test_prepare_demotion_does_not_upload(self) -> None:
+        release = add_source_release(self.fake, 302, "v4", prerelease=False)
+        add_relay_release(self.fake, release)
+        self.fake.repositories[SOURCE_REPO][302]["prerelease"] = True
+        with mock.patch.object(relay, "log") as log:
+            result = relay.prepare_release(
+                self.config, self.fake, self.fake, RELAY_REPO,
+                "foundation-sunshine", 302, "import", True, self.staging,
+                sleep=lambda _: None, clock=lambda: 0.0,
+            )
+        self.assertFalse(result["upload"])
+        self.assertEqual("demotion-ignored", result["mirror_state"])
+        self.assertTrue(
+            any("demotion ignored" in str(call) for call in log.call_args_list)
+        )
+
+
+class ManifestTests(unittest.TestCase):
+    def test_legacy_manifest_migrates_single_channel(self) -> None:
+        legacy = {
+            "schema_version": 1,
+            "mirror": {"channel": "stable", "status": "uploaded"},
+            "note": {"status": "failed", "body_sha256": "abc"},
+        }
+        merged = relay.migrate_manifest(legacy)
+        self.assertEqual("uploaded", relay.upload_record(merged, "stable")["status"])
+        self.assertEqual("failed", relay.note_record(merged, "stable")["status"])
+        self.assertEqual(2, merged["schema_version"])
+        self.assertEqual({}, relay.upload_record(merged, "beta"))
+
+
+class WorkflowTests(unittest.TestCase):
+    def test_official_action_fallback_is_wired(self) -> None:
+        text = (ROOT / ".github/workflows/relay.yml").read_text(encoding="utf-8")
+        self.assertIn("use_official_action:", text)
+        self.assertIn("MirrorChyan/uploading-action@v1", text)
+        self.assertIn("macos-latest", text)
+        self.assertIn("--channel", text)
 
 
 class LiveGatingTests(unittest.TestCase):

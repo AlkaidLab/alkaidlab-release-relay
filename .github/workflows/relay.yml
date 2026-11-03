@@ -18,6 +18,11 @@ on:
         required: true
         default: true
         type: boolean
+      use_official_action:
+        description: Use MirrorChyan/uploading-action on macOS for comparison
+        required: true
+        default: false
+        type: boolean
   schedule:
     - cron: '*/15 * * * *'
 
@@ -93,7 +98,7 @@ jobs:
   import:
     needs: plan
     if: needs.plan.outputs.has_work == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ (inputs.use_official_action && 'macos-latest') || 'ubuntu-latest' }}
     permissions:
       actions: write
       contents: write
@@ -138,7 +143,7 @@ jobs:
 
       - name: Upload package to MirrorChyan
         id: mirror
-        if: steps.prepare.outputs.upload == 'true'
+        if: steps.prepare.outputs.upload == 'true' && inputs.use_official_action != true
         continue-on-error: true
         env:
           MIRROR_UPLOAD_TOKEN: ${{ secrets.MirrorChyanUploadToken }}
@@ -157,6 +162,21 @@ jobs:
             --arch "$UPLOAD_ARCH" \
             --file "$ASSET_PATH"
 
+      - name: Upload package with the official action
+        id: mirror_official
+        if: steps.prepare.outputs.upload == 'true' && inputs.use_official_action == true
+        continue-on-error: true
+        uses: MirrorChyan/uploading-action@v1
+        with:
+          filetype: local
+          filename: ${{ steps.prepare.outputs.asset_path }}
+          version_name: ${{ steps.prepare.outputs.version_name }}
+          channel: ${{ steps.prepare.outputs.channel }}
+          mirrorchyan_rid: ${{ steps.prepare.outputs.resource_id }}
+          os: ${{ steps.prepare.outputs.os }}
+          arch: ${{ steps.prepare.outputs.arch }}
+          upload_token: ${{ secrets.MirrorChyanUploadToken }}
+
       - name: Verify published version
         id: verify
         if: steps.prepare.outputs.upload == 'true'
@@ -166,7 +186,7 @@ jobs:
           CHANNEL: ${{ steps.prepare.outputs.channel }}
           QUERY_OS: ${{ steps.prepare.outputs.query_os }}
           QUERY_ARCH: ${{ steps.prepare.outputs.query_arch }}
-          UPLOAD_OUTCOME: ${{ steps.mirror.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.mirror.outcome != 'skipped' && steps.mirror.outcome || steps.mirror_official.outcome }}
         run: |
           python scripts/relay_release.py verify-mirror \
             --rid "$RID" \
@@ -194,6 +214,7 @@ jobs:
           PRODUCT: ${{ matrix.product }}
           RELEASE_ID: ${{ matrix.release_id }}
           RELAY_TAG: ${{ steps.prepare.outputs.relay_tag }}
+          CHANNEL: ${{ steps.prepare.outputs.channel }}
           MIRROR_OUTCOME: ${{ steps.verify.outcome }}
           NOTE_OUTCOME: ${{ steps.note.outcome }}
           BODY_SHA256: ${{ steps.prepare.outputs.body_sha256 }}
@@ -203,6 +224,7 @@ jobs:
             --product "$PRODUCT" \
             --release-id "$RELEASE_ID" \
             --relay-tag "$RELAY_TAG" \
+            --channel "$CHANNEL" \
             --mirror-outcome "$MIRROR_OUTCOME" \
             --note-outcome "$NOTE_OUTCOME" \
             --body-sha256 "$BODY_SHA256" \

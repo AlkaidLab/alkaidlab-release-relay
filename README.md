@@ -35,6 +35,9 @@ Only `foundation-sunshine` Windows x64 is configured. See
    the manifest records the upload.
 5. The release note is sent for new releases and whenever the source body
    changes. A failed note is retried by the next run.
+6. When a release is promoted from pre-release to stable, the same verified
+   bytes are uploaded once to the stable channel and the note is synced to
+   stable. A demotion back to pre-release is logged and never uploaded.
 
 State lives in the relay Releases and their manifests. No Actions artifacts and
 no committed state files are required. See [docs/relay-architecture.md](docs/relay-architecture.md)
@@ -52,6 +55,9 @@ note is still sent with `MirrorChyan/release-note-action@v1`.
 
 - `workflow_dispatch`: `product`, optional exact `tag`, and `dry_run` (default
   `true`). With an empty tag the job processes every pending or edited release.
+  `use_official_action=true` runs the package upload through
+  `MirrorChyan/uploading-action@v1` on `macos-latest` for comparison; the relay
+  client remains the default.
 - `schedule`: every 15 minutes. It imports only when the repository variable
   `RELAY_LIVE` is `1`; otherwise it reports the pending work in the run summary.
 

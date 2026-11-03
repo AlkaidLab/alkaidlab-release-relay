@@ -610,6 +610,44 @@ def relay_asset_problem(
     return None
 
 
+def migrate_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Normalise an older single-channel manifest to per-channel records."""
+    mirror = manifest.setdefault("mirror", {})
+    uploads = mirror.get("uploads")
+    if not isinstance(uploads, dict):
+        uploads = {}
+        channel = mirror.get("channel")
+        if channel and mirror.get("status"):
+            uploads[channel] = {
+                "status": mirror["status"],
+                "uploaded_at": mirror.get("uploaded_at"),
+                "run_url": mirror.get("run_url"),
+            }
+        mirror["uploads"] = uploads
+    note = manifest.setdefault("note", {})
+    notes = note.get("uploads")
+    if not isinstance(notes, dict):
+        notes = {}
+        channel = mirror.get("channel") or note.get("channel")
+        if channel and note.get("status"):
+            notes[channel] = {
+                "status": note["status"],
+                "body_sha256": note.get("body_sha256"),
+                "synced_at": note.get("synced_at"),
+            }
+        note["uploads"] = notes
+    manifest["schema_version"] = 2
+    return manifest
+
+
+def upload_record(manifest: dict[str, Any], channel: str) -> dict[str, Any]:
+    return (manifest.get("mirror") or {}).get("uploads", {}).get(channel) or {}
+
+
+def note_record(manifest: dict[str, Any], channel: str) -> dict[str, Any]:
+    return (manifest.get("note") or {}).get("uploads", {}).get(channel) or {}
+
+
 def build_manifest(
     product_key: str,
     product: dict[str, Any],
@@ -624,7 +662,7 @@ def build_manifest(
     rule = get_rule(product_key, product)
     mirror = product["mirror"]
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "product": product_key,
         "source": {
             "kind": "github",
@@ -650,15 +688,15 @@ def build_manifest(
             "channel": channel_for(release),
             "os": rule["os"],
             "arch": rule["arch"],
-            "status": "started" if live else "pending",
-            "attempted_at": iso_now() if live else None,
-            "run_url": os.environ.get("RELAY_RUN_URL"),
+            "uploads": {
+                channel_for(release): {
+                    "status": "started" if live else "pending",
+                    "started_at": iso_now() if live else None,
+                    "run_url": os.environ.get("RELAY_RUN_URL"),
+                }
+            },
         },
-        "note": {
-            "status": "pending",
-            "body_sha256": None,
-            "synced_at": None,
-        },
+        "note": {"channel": channel_for(release), "uploads": {}},
     }
 
 
@@ -718,6 +756,7 @@ def classify_known_release(
     relay_release: dict[str, Any],
     relay: GitHubClient,
     relay_repo: str,
+    dry_run: bool = False,
 ) -> list[dict[str, Any]]:
     rule = get_rule(product_key, product)
     matches = matching_assets(release, rule)
@@ -739,40 +778,50 @@ def classify_known_release(
                 f"relay release {relay_release.get('tag_name')} has no {MANIFEST_NAME}",
             )
         ]
+    manifest = migrate_manifest(manifest)
     problem = relay_asset_problem(relay_release, manifest)
     if problem is not None:
         return [attention_entry(product_key, release, problem)]
-    status = (manifest.get("mirror") or {}).get("status")
+    channel = channel_for(release)
+    current = upload_record(manifest, channel)
+    status = current.get("status")
     if status in {"started", "failed"}:
         return [
             attention_entry(
                 product_key,
                 release,
-                f"MirrorChyan upload for {relay_release.get('tag_name')} is {status!r}; "
-                "inspect MirrorChyan before removing the relay release",
+                f"MirrorChyan {channel} upload for {relay_release.get('tag_name')} "
+                f"is {status!r}; inspect MirrorChyan before removing the relay release",
             )
         ]
-    body = release.get("body") or ""
-    note = manifest.get("note") or {}
-    if note.get("body_sha256") != text_sha256(body) and body:
-        return [make_entry(product_key, release, "note", "edited")]
-    if note.get("status") == "failed":
-        return [make_entry(product_key, release, "note", "retry-note")]
+    stable_uploaded = upload_record(manifest, "stable").get("status") == "uploaded"
+    beta_uploaded = upload_record(manifest, "beta").get("status") == "uploaded"
     if status != "uploaded":
-        return [
-            attention_entry(
-                product_key,
-                release,
-                f"MirrorChyan upload for {relay_release.get('tag_name')} is {status!r}",
+        if channel == "beta" and stable_uploaded:
+            log(
+                f"demotion ignored for {release['tag_name']}: the stable upload "
+                "already exists; not uploading to beta"
             )
-        ]
+            return []
+        if channel == "stable" and beta_uploaded:
+            return [
+                make_entry(product_key, release, "promote", "promotion", dry_run=dry_run)
+            ]
+        return [make_entry(product_key, release, "import", "new", dry_run=dry_run)]
+    body = release.get("body") or ""
+    note = note_record(manifest, channel)
+    if note.get("status") == "failed":
+        return [make_entry(product_key, release, "note", "retry-note", dry_run=dry_run)]
+    if note.get("body_sha256") != text_sha256(body) and body:
+        reason = "note-missing" if note.get("body_sha256") is None else "edited"
+        return [make_entry(product_key, release, "note", reason, dry_run=dry_run)]
     return []
 
 
 def plan_releases(
     config: dict[str, Any],
     source: GitHubClient,
-    relay: GitHubClient,
+    relay: GitHubClient | None,
     relay_repo: str,
     product_key: str | None = None,
     tag: str | None = None,
@@ -795,11 +844,22 @@ def plan_releases(
                     f"source release {tag!r} does not contain exactly one asset matching "
                     f"{rule['source_pattern']!r}"
                 )
+            relay_tag = build_relay_tag(key, release["tag_name"], int(release["id"]))
+            known = (
+                relay.get_release_by_tag(relay_repo, relay_tag)
+                if relay is not None
+                else None
+            )
+            if dry_run and known is not None:
+                entries.extend(
+                    classify_known_release(
+                        key, product, release, known, relay, relay_repo, dry_run=True
+                    )
+                )
+                continue
             if dry_run:
                 entries.append(make_entry(key, release, "import", "dry-run", dry_run=True))
                 continue
-            relay_tag = build_relay_tag(key, release["tag_name"], int(release["id"]))
-            known = relay.get_release_by_tag(relay_repo, relay_tag)
             if known is None:
                 entries.append(make_entry(key, release, "import", "dispatched"))
             else:
@@ -809,6 +869,8 @@ def plan_releases(
             continue
 
         releases = [item for item in source.list_releases(repository) if not item.get("draft")]
+        if relay is None:
+            raise RelayError("relay client is required to list relay releases")
         relay_releases = relay.list_releases(relay_repo)
         known: dict[int, dict[str, Any]] = {}
         for relay_release in relay_releases:
@@ -914,13 +976,14 @@ def prepare_release(
         raise RelayError(f"source release {release['tag_name']} is a draft")
     body = release.get("body") or ""
     body_hash = text_sha256(body)
+    channel = channel_for(release)
     relay_tag = build_relay_tag(product_key, release["tag_name"], int(release["id"]))
     result: dict[str, Any] = {
         "product": product_key,
         "release_id": int(release["id"]),
         "tag": release["tag_name"],
         "version_name": release["tag_name"],
-        "channel": channel_for(release),
+        "channel": channel,
         "resource_id": mirror["resource_id"],
         "os": rule["os"],
         "arch": rule["arch"],
@@ -940,7 +1003,7 @@ def prepare_release(
 
     if action == "note":
         if not live:
-            result["preview"] = f"would sync notes for {release['tag_name']}"
+            result["preview"] = f"would sync notes to {channel} for {release['tag_name']}"
             return result
         if relay is None:
             raise RelayError("relay client is required for a live note sync")
@@ -950,20 +1013,19 @@ def prepare_release(
         manifest = read_manifest(relay, relay_repo, relay_release)
         if manifest is None:
             raise RelayError(f"relay release {relay_tag} has no {MANIFEST_NAME}")
+        manifest = migrate_manifest(manifest)
         if not body:
             result["note_outcome"] = "empty"
             result["record"] = True
             return result
-        if (
-            (manifest.get("note") or {}).get("body_sha256") == body_hash
-            and (manifest.get("note") or {}).get("status") != "failed"
-        ):
+        note = note_record(manifest, channel)
+        if note.get("body_sha256") == body_hash and note.get("status") != "failed":
             return result
         result["sync_note"] = True
         result["record"] = True
         return result
 
-    if action != "import":
+    if action not in {"import", "promote"}:
         raise RelayError(f"unknown action {action!r}")
 
     matches = matching_assets(release, rule)
@@ -974,6 +1036,9 @@ def prepare_release(
         )
     current_asset = matches[0]
 
+    manifest: dict[str, Any] | None = None
+    relay_release: dict[str, Any] | None = None
+    needs_upload = True
     if live:
         if relay is None:
             raise RelayError("relay client is required for a live import")
@@ -982,6 +1047,7 @@ def prepare_release(
             manifest = read_manifest(relay, relay_repo, relay_release)
             if manifest is None:
                 raise RelayError(f"relay release {relay_tag} has no {MANIFEST_NAME}")
+            manifest = migrate_manifest(manifest)
             problem = relay_asset_problem(relay_release, manifest)
             if problem is not None:
                 raise RelayError(problem)
@@ -995,19 +1061,42 @@ def prepare_release(
                 raise RelayError(
                     f"source asset size for {release['tag_name']} changed after import"
                 )
-            status = (manifest.get("mirror") or {}).get("status")
+            status = upload_record(manifest, channel).get("status")
             if status in {"started", "failed"}:
                 raise RelayError(
-                    f"MirrorChyan upload for {relay_tag} is {status!r}; inspect "
+                    f"MirrorChyan {channel} upload for {relay_tag} is {status!r}; inspect "
                     "MirrorChyan before removing the relay release"
                 )
             if status == "uploaded":
-                if (manifest.get("note") or {}).get("body_sha256") != body_hash and body:
+                needs_upload = False
+            elif (
+                channel == "beta"
+                and upload_record(manifest, "stable").get("status") == "uploaded"
+            ):
+                log(
+                    f"demotion ignored for {release['tag_name']}: the stable upload "
+                    "already exists; not uploading to beta"
+                )
+                needs_upload = False
+                result["mirror_state"] = "demotion-ignored"
+            else:
+                result["promotion"] = (
+                    channel == "stable"
+                    and upload_record(manifest, "beta").get("status") == "uploaded"
+                )
+            if not needs_upload:
+                note = note_record(manifest, channel)
+                if body and (
+                    note.get("status") == "failed"
+                    or note.get("body_sha256") != body_hash
+                ):
                     result["sync_note"] = True
                     result["record"] = True
-                result["mirror_state"] = "already-uploaded"
+                elif not body and note.get("body_sha256") != body_hash:
+                    result["note_outcome"] = "empty"
+                    result["record"] = True
+                result["mirror_state"] = result.get("mirror_state", "already-uploaded")
                 return result
-            raise RelayError(f"relay release {relay_tag} has unexpected mirror state {status!r}")
 
     release, asset = wait_for_asset(
         source,
@@ -1039,27 +1128,50 @@ def prepare_release(
         }
     )
 
+    if manifest is not None and digest != (manifest.get("asset") or {}).get("sha256"):
+        raise RelayError(
+            f"source bytes for {release['tag_name']} differ from the recorded relay asset"
+        )
+
     if not live:
+        result["pending_reason"] = reason
         return result
 
-    manifest = build_manifest(
-        product_key, product, release, asset, size, digest, checksum_files, relay_tag, live
-    )
-    created = relay.create_release(
-        relay_repo,
-        relay_tag,
-        f"{product.get('display_name', product_key)} {release['tag_name']}",
-        relay_release_body(product_key, product, release, manifest),
-    )
-    relay.upload_asset(relay_repo, int(created["id"]), str(asset["name"]), destination)
-    write_manifest(relay, relay_repo, created, manifest)
+    if relay is None:
+        raise RelayError("relay client is required for a live import")
+    if relay_release is None:
+        manifest = build_manifest(
+            product_key, product, release, asset, size, digest, checksum_files, relay_tag, live
+        )
+        created = relay.create_release(
+            relay_repo,
+            relay_tag,
+            f"{product.get('display_name', product_key)} {release['tag_name']}",
+            relay_release_body(product_key, product, release, manifest),
+        )
+        relay.upload_asset(relay_repo, int(created["id"]), str(asset["name"]), destination)
+        write_manifest(relay, relay_repo, created, manifest)
+        result["relay_release_id"] = int(created["id"])
+    else:
+        mirror = manifest.setdefault("mirror", {})
+        mirror["channel"] = channel
+        mirror.setdefault("uploads", {})[channel] = {
+            "status": "started",
+            "started_at": iso_now(),
+            "run_url": os.environ.get("RELAY_RUN_URL"),
+        }
+        write_manifest(relay, relay_repo, relay_release, manifest)
+    note = note_record(manifest, channel)
     result.update(
         {
             "upload": True,
-            "sync_note": bool(body),
+            "sync_note": bool(body)
+            and (
+                note.get("status") == "failed"
+                or note.get("body_sha256") != body_hash
+            ),
             "record": True,
-            "relay_release_id": int(created["id"]),
-            "mirror_state": "started",
+            "mirror_state": "promotion" if result.get("promotion") else "started",
         }
     )
     return result
@@ -1074,6 +1186,7 @@ def record_outcome(
     relay_repo: str,
     release_id: int,
     relay_tag: str,
+    channel: str,
     mirror_outcome: str,
     note_outcome: str,
     body_sha256: str | None,
@@ -1087,22 +1200,33 @@ def record_outcome(
         raise RelayError(f"relay release {relay_tag} has no {MANIFEST_NAME}")
     if int((manifest.get("source") or {}).get("release_id", -1)) != int(release_id):
         raise RelayError(f"relay release {relay_tag} belongs to another source release")
+    manifest = migrate_manifest(manifest)
     mirror = manifest.setdefault("mirror", {})
     note = manifest.setdefault("note", {})
-    if mirror_outcome == "success":
-        mirror["status"] = "uploaded"
-        mirror["uploaded_at"] = iso_now()
-    elif mirror_outcome == "failure":
-        mirror["status"] = "failed"
-    if note_outcome == "success":
-        note["status"] = "synced"
-        note["body_sha256"] = body_sha256
-        note["synced_at"] = iso_now()
-    elif note_outcome == "failure":
-        note["status"] = "failed"
-    elif note_outcome == "empty":
-        note["status"] = "empty"
-        note["body_sha256"] = body_sha256
+    mirror["channel"] = channel
+    uploads = mirror.setdefault("uploads", {})
+    if mirror_outcome in {"success", "failure"}:
+        record = uploads.setdefault(channel, {})
+        if mirror_outcome == "success":
+            record["status"] = "uploaded"
+            record["uploaded_at"] = iso_now()
+            if run_url:
+                record["run_url"] = run_url
+        else:
+            record["status"] = "failed"
+    note["channel"] = channel
+    notes = note.setdefault("uploads", {})
+    if note_outcome in {"success", "failure", "empty"}:
+        note_state = notes.setdefault(channel, {})
+        if note_outcome == "success":
+            note_state["status"] = "synced"
+            note_state["body_sha256"] = body_sha256
+            note_state["synced_at"] = iso_now()
+        elif note_outcome == "failure":
+            note_state["status"] = "failed"
+        else:
+            note_state["status"] = "empty"
+            note_state["body_sha256"] = body_sha256
     if run_url:
         manifest["last_run"] = {"url": run_url, "at": iso_now()}
     write_manifest(relay, relay_repo, relay_release, manifest)
@@ -1350,12 +1474,12 @@ def render_plan_summary(entries: list[dict[str, Any]], event: str, live: bool) -
         "",
     ]
     if not entries:
-        lines.append("No release needs an import or a note sync.")
+        lines.append("No release needs an upload or a note sync.")
         return "\n".join(lines) + "\n"
     lines.extend(
         [
-            "| product | release | tag | action | reason |",
-            "| --- | --- | --- | --- | --- |",
+            "| product | release | tag | channel | action | reason |",
+            "| --- | --- | --- | --- | --- | --- |",
         ]
     )
     for entry in entries:
@@ -1363,6 +1487,7 @@ def render_plan_summary(entries: list[dict[str, Any]], event: str, live: bool) -
         reason = str(entry.get("reason") or "").replace("|", "\\|")
         lines.append(
             f"| {entry['product']} | {entry['release_id']} | {tag} | "
+            f"{entry.get('channel', '')} | "
             f"{entry['action']} | {reason} |"
         )
     if not live and event == "schedule":
@@ -1403,8 +1528,11 @@ def cmd_plan(args: argparse.Namespace) -> int:
     keys = [args.product] if args.product else sorted(config["products"])
     entries: list[dict[str, Any]] = []
     relay: GitHubClient | None = None
-    if not (args.tag and dry_run):
+    try:
         relay = relay_client()
+    except RelayError:
+        if not (args.tag and dry_run):
+            raise
     for key in keys:
         product = get_product(config, key)
         source = client_for_product(product)
@@ -1412,7 +1540,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
             plan_releases(
                 config,
                 source,
-                relay if relay is not None else GitHubClient(),
+                relay,
                 relay_repo,
                 product_key=key,
                 tag=args.tag or None,
@@ -1517,6 +1645,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
             "relay_tag": result["relay_tag"],
             "body_sha256": result["body_sha256"],
             "release_note": result.get("release_note") or "",
+            "promotion": str(bool(result.get("promotion"))).lower(),
         },
     )
     log(
@@ -1524,6 +1653,10 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         f"channel={result['channel']} upload={result['upload']} "
         f"sync_note={result['sync_note']} record={result['record']}"
     )
+    if result.get("promotion"):
+        log(f"promotion: {result['channel']} upload planned for {result['version_name']}")
+    if result.get("pending_reason"):
+        log(f"planned action: {result['pending_reason']} channel={result['channel']}")
     if result.get("asset_name"):
         log(f"asset: {result['asset_name']} {result['asset_size']} bytes")
         log(f"sha256: {result['asset_sha256']}")
@@ -1540,14 +1673,16 @@ def cmd_record(args: argparse.Namespace) -> int:
         relay_repo,
         args.release_id,
         args.relay_tag,
+        args.channel,
         args.mirror_outcome or "skipped",
         args.note_outcome or "skipped",
         args.body_sha256,
         args.run_url,
     )
     log(
-        f"recorded {args.relay_tag}: mirror={manifest['mirror']['status']} "
-        f"note={manifest['note']['status']}"
+        f"recorded {args.relay_tag} {args.channel}: "
+        f"mirror={upload_record(manifest, args.channel).get('status')} "
+        f"note={note_record(manifest, args.channel).get('status')}"
     )
     return 0
 
@@ -1601,7 +1736,9 @@ def build_parser() -> argparse.ArgumentParser:
     prepare = subparsers.add_parser("prepare", help="download, verify and stage one release")
     prepare.add_argument("--product", required=True)
     prepare.add_argument("--release-id", type=int, required=True)
-    prepare.add_argument("--action", default="import", choices=["import", "note", "attention"])
+    prepare.add_argument(
+        "--action", default="import", choices=["import", "promote", "note", "attention"]
+    )
     prepare.add_argument("--reason", default="")
     prepare.add_argument("--live")
     prepare.add_argument("--staging-dir", default="staging")
@@ -1615,6 +1752,7 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--product", required=True)
     record.add_argument("--release-id", type=int, required=True)
     record.add_argument("--relay-tag", required=True)
+    record.add_argument("--channel", required=True, choices=["stable", "beta"])
     record.add_argument("--mirror-outcome", default="skipped")
     record.add_argument("--note-outcome", default="skipped")
     record.add_argument("--body-sha256")
