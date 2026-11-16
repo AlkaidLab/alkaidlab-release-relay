@@ -968,6 +968,19 @@ class LiveGatingTests(unittest.TestCase):
         self.assertTrue(relay.resolve_live("schedule", "", "1"))
         self.assertFalse(relay.resolve_live("schedule", "", ""))
 
+    def test_release_dispatch_follows_the_same_approval_as_the_schedule(self) -> None:
+        self.assertTrue(relay.resolve_live("repository_dispatch", "", "1"))
+        self.assertFalse(relay.resolve_live("repository_dispatch", "", ""))
+        self.assertFalse(relay.resolve_live("repository_dispatch", "", "0"))
+
+    def test_dry_release_dispatch_has_no_jobs_but_a_live_one_has(self) -> None:
+        entry = [{"product": "p", "release_id": 1, "tag": "v1", "action": "import", "reason": "new"}]
+        summary, has_work, matrix = relay.summary_and_matrix(entry, "repository_dispatch", False)
+        self.assertFalse(has_work)
+        self.assertEqual(matrix, [])
+        self.assertIn("release dispatch", summary)
+        self.assertTrue(relay.summary_and_matrix(entry, "repository_dispatch", True)[1])
+
     def test_dry_schedule_has_no_jobs(self) -> None:
         summary, has_work, matrix = relay.summary_and_matrix(
             [{"product": "p", "release_id": 1, "tag": "v1", "action": "import", "reason": "new"}],

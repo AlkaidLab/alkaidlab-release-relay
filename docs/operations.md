@@ -37,6 +37,15 @@ Use `dry_run=false` for a single tag after verifying the dry run:
 The scheduled job performs the same steps for new releases once
 `RELAY_LIVE=1`. It processes entries one at a time in release order.
 
+## Release webhook (instant start)
+
+The source repository's `release` webhook starts a run within seconds (see README, Triggers).
+If it breaks nothing is lost: the schedule still runs every 15 minutes. To check it: source
+repository -> Settings -> Webhooks -> Recent Deliveries (a `202` with `dispatched`, or `200` with
+`deduplicated`), then Actions here: a run with the event `repository_dispatch`. A `502` means GitHub
+refused the dispatch (the App installation must include this repository); a `401` means the secret
+differs between the webhook and the Worker (secret `RELEASE_HOOK_SECRET`, Bitwarden item "Release hook secret").
+
 ## Re-run behaviour
 
 A rerun is safe by design:

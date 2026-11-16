@@ -979,7 +979,8 @@ def plan_releases(
 def resolve_live(event: str, dry_run_input: Any, relay_live: Any) -> bool:
     if event == "workflow_dispatch":
         return not parse_bool(dry_run_input, default=True)
-    if event == "schedule":
+    if event in ("schedule", "repository_dispatch"):
+        # a release dispatch (the source repository's release webhook, see README) follows the same approval as the schedule: the repository variable
         return str(relay_live or "").strip() == "1"
     return False
 
@@ -1612,12 +1613,12 @@ def render_plan_summary(entries: list[dict[str, Any]], event: str, live: bool) -
             f"{entry.get('channel', '')} | "
             f"{entry['action']} | {reason} |"
         )
-    if not live and event == "schedule":
+    if not live and event in ("schedule", "repository_dispatch"):
         lines.extend(
             [
                 "",
-                "The schedule only imports while the repository variable "
-                "`RELAY_LIVE` is `1`.",
+                "The schedule and a release dispatch only import while the "
+                "repository variable `RELAY_LIVE` is `1`.",
             ]
         )
     elif not live:
@@ -1628,7 +1629,7 @@ def render_plan_summary(entries: list[dict[str, Any]], event: str, live: bool) -
 def summary_and_matrix(
     entries: list[dict[str, Any]], event: str, live: bool
 ) -> tuple[str, bool, list[dict[str, Any]]]:
-    run_jobs = live or event != "schedule"
+    run_jobs = live or event not in ("schedule", "repository_dispatch")
     matrix_entries = entries if run_jobs else []
     return render_plan_summary(entries, event, live), bool(matrix_entries), matrix_entries
 
