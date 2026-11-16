@@ -25,6 +25,9 @@ on:
         type: boolean
   schedule:
     - cron: '*/15 * * * *'
+  # the release webhook of the source repository (Worker POST /hooks/release) starts a run at once: client_payload {product, tag, release_id, action}
+  repository_dispatch:
+    types: [release-published]
 
 permissions:
   actions: write
@@ -72,8 +75,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           RELAY_SOURCE_TOKEN: ${{ secrets.RELAY_SOURCE_TOKEN }}
-          PRODUCT: ${{ inputs.product }}
-          TAG: ${{ inputs.tag }}
+          PRODUCT: ${{ inputs.product || github.event.client_payload.product }}
+          TAG: ${{ inputs.tag || github.event.client_payload.tag }}
           EVENT_NAME: ${{ github.event_name }}
           DRY_RUN: ${{ inputs.dry_run }}
           RELAY_LIVE: ${{ vars.RELAY_LIVE }}

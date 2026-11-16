@@ -63,6 +63,25 @@ note is still sent with `MirrorChyan/release-note-action@v1`.
   client remains the default.
 - `schedule`: every 15 minutes. It imports only when the repository variable
   `RELAY_LIVE` is `1`; otherwise it reports the pending work in the run summary.
+  This is the fallback: everything below only removes the wait.
+- `repository_dispatch` with `event_type: release-published` and
+  `client_payload: {product, tag, release_id, action}`: a run for exactly that
+  product and tag, started within seconds of the source release being published.
+  It follows the same approval as the schedule (it uploads only while `RELAY_LIVE`
+  is `1`) and is idempotent like every other run: a tag that is already uploaded is
+  skipped. Who sends it: the `release` webhook of `AlkaidLab/foundation-sunshine`
+  (events: release; payload URL `https://devapi.alkaidlab.com/hooks/release`) goes
+  to the Worker `alkaidlab-devmode`, which checks `X-Hub-Signature-256`, accepts only
+  `published` / `released` of a non-draft release of a configured repository whose
+  tag has the relay's shape, sends one dispatch per tag within 20 minutes (at most
+  20 an hour) with the GitHub App installation token limited to this repository
+  (`contents: write`, which is what creating a repository dispatch needs), and logs
+  only the tag and the outcome. The Worker's source is `src/releasehook.ts` in the
+  `alkaidlab-devmode-worker` repository.
+- By hand, the same thing: `gh api repos/AlkaidLab/alkaidlab-release-relay/dispatches
+  -f event_type=release-published -f 'client_payload[product]=foundation-sunshine'
+  -f 'client_payload[tag]=<tag>'`. To replay a real delivery: the webhook's
+  "Recent Deliveries" in the source repository, Redeliver.
 
 `workflow_dispatch` with `dry_run=false` uploads. A scheduled run uploads only
 after `RELAY_LIVE=1` is set.
